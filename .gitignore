@@ -52,3 +52,10 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+/binary_data
+/highperf_test_data
+/original_test_data
+/perf_test_binary
+/perf_test_csv
+/scalable_test_data
+/test_fixes
