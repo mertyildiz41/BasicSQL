@@ -371,53 +371,48 @@ namespace BasicSQL.Models
         }
 
         /// <summary>
-        /// Updates rows that match the predicate
+        /// Updates rows that match the predicate with optimized performance
+        /// Uses efficient row processing to minimize memory usage and only rewrite necessary data
         /// </summary>
         public int UpdateRows(Dictionary<string, object?> updates, Func<Dictionary<string, object?>, bool>? predicate = null)
         {
             try
             {
-                int updatedCount = 0;
-                var allRows = new List<Dictionary<string, object?>>();
-                
-                // Read all existing rows
-                foreach (var row in SelectRows())
+                if (_useBinaryFormat)
                 {
-                    var rowCopy = new Dictionary<string, object?>(row);
-                    
-                    // Check if this row matches the predicate
-                    if (predicate == null || predicate(rowCopy))
-                    {
-                        // Apply updates to this row
-                        foreach (var (columnName, newValue) in updates)
+                    // Use efficient binary processing for better performance
+                    return UpdateRowsBinary(updates, predicate);
+                }
+                else
+                {
+                    // Use the new CSV batch processing method for CSV format
+                    return _storageManager.ProcessRowsBatch(
+                        _metadata.TableName,
+                        _metadata,
+                        row => predicate == null || predicate(row),
+                        row =>
                         {
-                            if (rowCopy.ContainsKey(columnName))
+                            // Apply updates to this row
+                            var updatedRow = new Dictionary<string, object?>(row);
+                            foreach (var (columnName, newValue) in updates)
                             {
-                                // Validate the new value against column constraints
-                                var column = Columns.FirstOrDefault(c => c.Name == columnName);
-                                if (column != null)
+                                if (updatedRow.ContainsKey(columnName))
                                 {
-                                    rowCopy[columnName] = column.ConvertValue(newValue);
-                                }
-                                else
-                                {
-                                    rowCopy[columnName] = newValue;
+                                    var column = Columns.FirstOrDefault(c => c.Name == columnName);
+                                    if (column != null)
+                                    {
+                                        updatedRow[columnName] = column.ConvertValue(newValue);
+                                    }
+                                    else
+                                    {
+                                        updatedRow[columnName] = newValue;
+                                    }
                                 }
                             }
+                            return updatedRow;
                         }
-                        updatedCount++;
-                    }
-                    
-                    allRows.Add(rowCopy);
+                    );
                 }
-                
-                if (updatedCount > 0)
-                {
-                    // Rewrite the entire table with updated data
-                    RewriteTableData(allRows);
-                }
-                
-                return updatedCount;
             }
             catch (Exception ex)
             {
@@ -427,37 +422,118 @@ namespace BasicSQL.Models
         }
 
         /// <summary>
-        /// Deletes rows that match the predicate
+        /// Efficient UPDATE implementation for binary format using chunked processing
+        /// Processes binary files in batches to avoid full table rewrites when possible
+        /// </summary>
+        private int UpdateRowsBinary(Dictionary<string, object?> updates, Func<Dictionary<string, object?>, bool>? predicate)
+        {
+            // Use the storage manager's new binary batch processing method
+            return _storageManager.ProcessRowsBatchBinary(
+                _metadata.TableName,
+                _metadata,
+                row => predicate == null || predicate(row),
+                row =>
+                {
+                    // Apply updates to this row
+                    var updatedRow = new Dictionary<string, object?>(row);
+                    foreach (var (columnName, newValue) in updates)
+                    {
+                        if (updatedRow.ContainsKey(columnName))
+                        {
+                            var column = Columns.FirstOrDefault(c => c.Name == columnName);
+                            if (column != null)
+                            {
+                                updatedRow[columnName] = column.ConvertValue(newValue);
+                            }
+                            else
+                            {
+                                updatedRow[columnName] = newValue;
+                            }
+                        }
+                    }
+                    return updatedRow;
+                }
+            );
+        }
+        
+        /// <summary>
+        /// Batch update processing for large tables
+        /// </summary>
+        private int UpdateRowsBatch(Dictionary<string, object?> updates, Func<Dictionary<string, object?>, bool>? predicate)
+        {
+            int updatedCount = 0;
+            const int batchSize = 1000;
+            var allRows = new List<Dictionary<string, object?>>();
+            
+            foreach (var row in SelectRows())
+            {
+                var rowCopy = new Dictionary<string, object?>(row);
+                
+                // Check if this row matches the predicate
+                if (predicate == null || predicate(rowCopy))
+                {
+                    // Apply updates to this row
+                    foreach (var (columnName, newValue) in updates)
+                    {
+                        if (rowCopy.ContainsKey(columnName))
+                        {
+                            var column = Columns.FirstOrDefault(c => c.Name == columnName);
+                            if (column != null)
+                            {
+                                rowCopy[columnName] = column.ConvertValue(newValue);
+                            }
+                            else
+                            {
+                                rowCopy[columnName] = newValue;
+                            }
+                        }
+                    }
+                    updatedCount++;
+                }
+                
+                allRows.Add(rowCopy);
+            }
+            
+            if (updatedCount > 0)
+            {
+                RewriteTableData(allRows);
+            }
+            
+            return updatedCount;
+        }
+
+        /// <summary>
+        /// Deletes rows that match the predicate with optimized performance
+        /// Uses efficient row processing to minimize memory usage
         /// </summary>
         public int DeleteRows(Func<Dictionary<string, object?>, bool>? predicate = null)
         {
             try
             {
-                int deletedCount = 0;
-                var remainingRows = new List<Dictionary<string, object?>>();
-                
-                // Read all existing rows and keep only those that don't match the predicate
-                foreach (var row in SelectRows())
+                // Quick optimization: if predicate is null (delete all), just clear the table
+                if (predicate == null)
                 {
-                    if (predicate == null || predicate(row))
-                    {
-                        // This row should be deleted
-                        deletedCount++;
-                    }
-                    else
-                    {
-                        // Keep this row
-                        remainingRows.Add(row);
-                    }
+                    var totalRows = _metadata.TotalRows;
+                    _storageManager.DeleteTable(_metadata.TableName);
+                    ResetTableMetadata();
+                    return totalRows;
                 }
                 
-                if (deletedCount > 0)
+                if (_useBinaryFormat)
                 {
-                    // Rewrite the table with remaining data
-                    RewriteTableData(remainingRows);
+                    // Use efficient binary processing
+                    return DeleteRowsBinary(predicate);
                 }
-                
-                return deletedCount;
+                else
+                {
+                    // Use the new CSV batch processing method for CSV format
+                    return _storageManager.ProcessRowsBatch(
+                        _metadata.TableName,
+                        _metadata,
+                        row => predicate(row),  // Identify rows to delete
+                        null  // null updateFunction means delete the row
+                    );
+                }
             }
             catch (Exception ex)
             {
@@ -467,7 +543,44 @@ namespace BasicSQL.Models
         }
 
         /// <summary>
+        /// Efficient DELETE implementation for binary format using batch processing
+        /// Processes binary files in batches to avoid full table rewrites when possible
+        /// </summary>
+        private int DeleteRowsBinary(Func<Dictionary<string, object?>, bool> predicate)
+        {
+            // Use the storage manager's new binary batch processing method for deletions
+            return _storageManager.ProcessRowsBatchBinary(
+                _metadata.TableName,
+                _metadata,
+                row => predicate(row),  // Identify rows to delete
+                null  // null updateFunction means delete the row
+            );
+        }
+        
+        /// <summary>
+        /// Resets table metadata for empty table
+        /// </summary>
+        private void ResetTableMetadata()
+        {
+            var originalAutoIncrement = new Dictionary<string, long>(_metadata.AutoIncrementValues);
+            _metadata = new ScalableTableMetadata
+            {
+                TableName = _metadata.TableName,
+                Columns = _metadata.Columns,
+                HasPrimaryKey = _metadata.HasPrimaryKey,
+                PrimaryKeyColumn = _metadata.PrimaryKeyColumn,
+                Created = _metadata.Created,
+                LastModified = DateTime.UtcNow,
+                TotalRows = 0,
+                NextRowId = 0,
+                AutoIncrementValues = originalAutoIncrement
+            };
+            _storageManager.SaveTableMetadata(_metadata.TableName, _metadata);
+        }
+
+        /// <summary>
         /// Rewrites the entire table data (used for UPDATE and DELETE operations)
+        /// Optimized for better performance
         /// </summary>
         private void RewriteTableData(List<Dictionary<string, object?>> rows)
         {
@@ -489,33 +602,37 @@ namespace BasicSQL.Models
                 AutoIncrementValues = originalAutoIncrement
             };
             
-            // Re-add all rows
-            foreach (var row in rows)
+            // Optimize: batch insert rows for better performance
+            const int batchSize = 5000; // Larger batch size for better performance
+            var tempColumns = new List<Column>();
+            
+            // Prepare temporary columns without auto-increment for bulk insert
+            foreach (var col in Columns)
             {
-                // For rewriting, we want to preserve existing values including auto-increment IDs
-                // So we don't let AddRow reassign auto-increment values
-                var preservedRow = new Dictionary<string, object?>(row);
-                
-                // Remove auto-increment handling temporarily by creating a copy without auto-increment columns
-                var tempColumns = new List<Column>();
-                foreach (var col in Columns)
+                var tempCol = new Column(col.Name, col.DataType, col.IsNullable, col.IsPrimaryKey, false);
+                tempColumns.Add(tempCol);
+            }
+            var originalColumns = Columns;
+            Columns = tempColumns;
+            
+            try
+            {
+                // Process rows in batches
+                for (int i = 0; i < rows.Count; i += batchSize)
                 {
-                    var tempCol = new Column(col.Name, col.DataType, col.IsNullable, col.IsPrimaryKey, false); // Set auto-increment to false
-                    tempColumns.Add(tempCol);
+                    var batch = rows.Skip(i).Take(batchSize);
+                    
+                    foreach (var row in batch)
+                    {
+                        // Add the row without auto-increment processing
+                        AddRowInternal(row);
+                    }
                 }
-                var originalColumns = Columns;
-                Columns = tempColumns;
-                
-                try
-                {
-                    // Add the row without auto-increment processing
-                    AddRowInternal(preservedRow);
-                }
-                finally
-                {
-                    // Restore original columns
-                    Columns = originalColumns;
-                }
+            }
+            finally
+            {
+                // Restore original columns
+                Columns = originalColumns;
             }
             
             // Save metadata

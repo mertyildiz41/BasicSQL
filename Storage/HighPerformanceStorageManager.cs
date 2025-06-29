@@ -584,5 +584,387 @@ namespace BasicSQL.Storage
         {
             return Path.Combine(_metaDirectory, $"{tableName}_metadata.json");
         }
+
+        /// <summary>
+        /// Performs efficient batch update/delete operations using a streaming approach
+        /// Returns the number of rows that were modified or deleted
+        /// </summary>
+        public int ProcessRowsBatch(string tableName, ScalableTableMetadata metadata, 
+            Func<Dictionary<string, object?>, bool> shouldUpdate, 
+            Func<Dictionary<string, object?>, Dictionary<string, object?>>? updateFunction = null)
+        {
+            var tempDir = Path.Combine(Path.GetTempPath(), $"sql_temp_{Guid.NewGuid():N}");
+            Directory.CreateDirectory(tempDir);
+            
+            try
+            {
+                var totalFiles = (metadata.TotalRows + _rowsPerFile - 1) / _rowsPerFile;
+                var newTotalRows = 0;
+                var hasChanges = false;
+                var modifiedRowCount = 0;
+
+                // Process each file
+                for (int fileIndex = 0; fileIndex < totalFiles; fileIndex++)
+                {
+                    var sourceFilePath = GetTableCsvFilePath(tableName, fileIndex);
+                    if (!File.Exists(sourceFilePath)) continue;
+
+                    var tempFilePath = Path.Combine(tempDir, $"temp_{fileIndex:D6}.csv");
+                    var fileHasChanges = false;
+                    var rowsInThisFile = 0;
+
+                    using (var reader = new StreamReader(sourceFilePath, Encoding.UTF8))
+                    using (var writer = new StreamWriter(tempFilePath, false, Encoding.UTF8, _bufferSize))
+                    {
+                        // Copy header
+                        var header = reader.ReadLine();
+                        if (header != null)
+                        {
+                            writer.WriteLine(header);
+                        }
+
+                        string line;
+                        while ((line = reader.ReadLine()) != null)
+                        {
+                            var row = ParseCsvRow(line, metadata.Columns);
+                            
+                            if (shouldUpdate(row))
+                            {
+                                modifiedRowCount++;
+                                if (updateFunction != null)
+                                {
+                                    // Update operation
+                                    var updatedRow = updateFunction(row);
+                                    var csvLine = CreateCsvLine(updatedRow, metadata.Columns);
+                                    writer.WriteLine(csvLine);
+                                    rowsInThisFile++;
+                                    fileHasChanges = true;
+                                }
+                                // If updateFunction is null, this is a delete operation - skip writing the row
+                                else
+                                {
+                                    fileHasChanges = true;
+                                    // Don't write the row (delete it)
+                                }
+                            }
+                            else
+                            {
+                                // Row doesn't match criteria - keep it unchanged
+                                writer.WriteLine(line);
+                                rowsInThisFile++;
+                            }
+                        }
+                    }
+
+                    if (fileHasChanges)
+                    {
+                        hasChanges = true;
+                    }
+
+                    newTotalRows += rowsInThisFile;
+
+                    // Only move temp file if we have rows or this is the first file (to preserve header)
+                    if (rowsInThisFile > 0 || fileIndex == 0)
+                    {
+                        // Delete the original file first to avoid "file already exists" error
+                        if (File.Exists(sourceFilePath))
+                        {
+                            File.Delete(sourceFilePath);
+                        }
+                        File.Move(tempFilePath, sourceFilePath);
+                    }
+                    else if (File.Exists(sourceFilePath))
+                    {
+                        // Remove empty file
+                        File.Delete(sourceFilePath);
+                    }
+                }
+
+                if (hasChanges)
+                {
+                    metadata.TotalRows = newTotalRows;
+                    metadata.LastModified = DateTime.UtcNow;
+                    SaveTableMetadata(tableName, metadata);
+                }
+                
+                return modifiedRowCount;
+            }
+            finally
+            {
+                // Clean up temp directory
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Efficiently processes rows in binary format using batch operations
+        /// Minimizes memory usage and only rewrites files that have changes
+        /// Returns the number of rows that were modified or deleted
+        /// </summary>
+        public int ProcessRowsBatchBinary(string tableName, ScalableTableMetadata metadata, 
+            Func<Dictionary<string, object?>, bool> shouldUpdate, 
+            Func<Dictionary<string, object?>, Dictionary<string, object?>>? updateFunction = null)
+        {
+            var tempDir = Path.Combine(Path.GetTempPath(), $"sql_temp_bin_{Guid.NewGuid():N}");
+            Directory.CreateDirectory(tempDir);
+            
+            try
+            {
+                var totalFiles = (metadata.TotalRows + _rowsPerFile - 1) / _rowsPerFile;
+                var newTotalRows = 0;
+                var hasChanges = false;
+                var modifiedRowCount = 0;
+
+                // Process each binary file
+                for (int fileIndex = 0; fileIndex < totalFiles; fileIndex++)
+                {
+                    var sourceFilePath = GetTableDataFilePath(tableName, fileIndex);
+                    if (!File.Exists(sourceFilePath)) continue;
+
+                    var tempFilePath = Path.Combine(tempDir, $"temp_{fileIndex:D6}.bin");
+                    var fileHasChanges = false;
+                    var rowsInThisFile = 0;
+
+                    using (var reader = new FileStream(sourceFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, _bufferSize))
+                    using (var writer = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write, FileShare.None, _bufferSize))
+                    {
+                        // Copy binary header if it exists
+                        var headerBuffer = new byte[BINARY_HEADER.Length];
+                        if (reader.Read(headerBuffer, 0, headerBuffer.Length) == headerBuffer.Length &&
+                            headerBuffer.SequenceEqual(BINARY_HEADER))
+                        {
+                            writer.Write(BINARY_HEADER);
+                        }
+                        else
+                        {
+                            reader.Position = 0; // Reset if no header found
+                        }
+
+                        // Process rows in this file
+                        while (reader.Position < reader.Length)
+                        {
+                            var row = ReadBinaryRowFromStream(reader, metadata.Columns);
+                            if (row == null) break; // End of file or corrupted data
+                            
+                            if (shouldUpdate(row))
+                            {
+                                modifiedRowCount++;
+                                if (updateFunction != null)
+                                {
+                                    // Update operation
+                                    var updatedRow = updateFunction(row);
+                                    WriteBinaryRow(writer, updatedRow, metadata.Columns);
+                                    rowsInThisFile++;
+                                    fileHasChanges = true;
+                                }
+                                // If updateFunction is null, this is a delete operation - skip writing the row
+                                else
+                                {
+                                    fileHasChanges = true;
+                                    // Don't write the row (delete it)
+                                }
+                            }
+                            else
+                            {
+                                // Row doesn't match criteria - keep it unchanged
+                                WriteBinaryRow(writer, row, metadata.Columns);
+                                rowsInThisFile++;
+                            }
+                        }
+                    }
+
+                    if (fileHasChanges)
+                    {
+                        hasChanges = true;
+                    }
+
+                    newTotalRows += rowsInThisFile;
+
+                    // Only move temp file if we have rows
+                    if (rowsInThisFile > 0)
+                    {
+                        // Delete the original file first to avoid "file already exists" error
+                        if (File.Exists(sourceFilePath))
+                        {
+                            File.Delete(sourceFilePath);
+                        }
+                        File.Move(tempFilePath, sourceFilePath);
+                    }
+                    else if (File.Exists(sourceFilePath))
+                    {
+                        // Remove empty file
+                        File.Delete(sourceFilePath);
+                    }
+                }
+
+                if (hasChanges)
+                {
+                    metadata.TotalRows = newTotalRows;
+                    metadata.LastModified = DateTime.UtcNow;
+                    SaveTableMetadata(tableName, metadata);
+                }
+                
+                return modifiedRowCount;
+            }
+            finally
+            {
+                // Clean up temp directory
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Reads a single binary row from a stream
+        /// </summary>
+        private Dictionary<string, object?>? ReadBinaryRowFromStream(FileStream stream, List<ColumnFileData> columns)
+        {
+            try
+            {
+                var row = new Dictionary<string, object?>();
+                
+                foreach (var column in columns)
+                {
+                    var markerByte = stream.ReadByte();
+                    if (markerByte == -1) return null; // End of stream
+                    
+                    var marker = (byte)markerByte;
+                    
+                    switch (marker)
+                    {
+                        case NULL_MARKER:
+                            row[column.Name] = null;
+                            break;
+                            
+                        case STRING_MARKER:
+                            var lengthBytes = new byte[4];
+                            if (stream.Read(lengthBytes, 0, 4) != 4) return null;
+                            var length = BitConverter.ToInt32(lengthBytes, 0);
+                            var stringBytes = new byte[length];
+                            if (stream.Read(stringBytes, 0, length) != length) return null;
+                            row[column.Name] = Encoding.UTF8.GetString(stringBytes);
+                            break;
+                            
+                        case INTEGER_MARKER:
+                            var intBytes = new byte[4];
+                            if (stream.Read(intBytes, 0, 4) != 4) return null;
+                            row[column.Name] = BitConverter.ToInt32(intBytes, 0);
+                            break;
+                            
+                        case LONG_MARKER:
+                            var longBytes = new byte[8];
+                            if (stream.Read(longBytes, 0, 8) != 8) return null;
+                            row[column.Name] = BitConverter.ToInt64(longBytes, 0);
+                            break;
+                            
+                        case REAL_MARKER:
+                            var doubleBytes = new byte[8];
+                            if (stream.Read(doubleBytes, 0, 8) != 8) return null;
+                            row[column.Name] = BitConverter.ToDouble(doubleBytes, 0);
+                            break;
+                            
+                        default:
+                            throw new InvalidOperationException($"Unknown binary marker: {marker}");
+                    }
+                }
+                
+                // Check for row separator
+                var separatorByte = stream.ReadByte();
+                if (separatorByte != ROW_SEPARATOR && separatorByte != -1)
+                {
+                    // Try to recover by seeking to next separator
+                    while (stream.Position < stream.Length && stream.ReadByte() != ROW_SEPARATOR) { }
+                }
+                
+                return row;
+            }
+            catch
+            {
+                return null; // Corrupted data, skip this row
+            }
+        }
+
+        /// <summary>
+        /// Creates a CSV line from a row dictionary
+        /// </summary>
+        private string CreateCsvLine(Dictionary<string, object?> row, List<ColumnFileData> columns)
+        {
+            var values = new List<string>();
+            foreach (var column in columns)
+            {
+                if (row.TryGetValue(column.Name, out var value))
+                {
+                    values.Add(EscapeCsvValue(value?.ToString() ?? ""));
+                }
+                else
+                {
+                    values.Add("");
+                }
+            }
+            return string.Join(",", values);
+        }
+
+        /// <summary>
+        /// Parses CSV values from a line, handling quoted values
+        /// </summary>
+        private List<string> ParseCsvValues(string csvLine)
+        {
+            var values = new List<string>();
+            var current = new StringBuilder();
+            var inQuotes = false;
+            
+            for (int i = 0; i < csvLine.Length; i++)
+            {
+                var ch = csvLine[i];
+                
+                if (ch == '"')
+                {
+                    if (inQuotes && i + 1 < csvLine.Length && csvLine[i + 1] == '"')
+                    {
+                        // Escaped quote
+                        current.Append('"');
+                        i++; // Skip next quote
+                    }
+                    else
+                    {
+                        inQuotes = !inQuotes;
+                    }
+                }
+                else if (ch == ',' && !inQuotes)
+                {
+                    values.Add(current.ToString());
+                    current.Clear();
+                }
+                else
+                {
+                    current.Append(ch);
+                }
+            }
+            
+            values.Add(current.ToString());
+            return values;
+        }
+
+        /// <summary>
+        /// Converts a string value to the appropriate type
+        /// </summary>
+        private object? ConvertValue(string value, string type)
+        {
+            if (string.IsNullOrEmpty(value)) return null;
+            
+            return type.ToUpper() switch
+            {
+                "INTEGER" or "INT" => int.TryParse(value, out var intVal) ? intVal : null,
+                "BIGINT" or "LONG" => long.TryParse(value, out var longVal) ? longVal : null,
+                "REAL" or "FLOAT" or "DOUBLE" => double.TryParse(value, out var doubleVal) ? doubleVal : null,
+                "TEXT" or "STRING" or "VARCHAR" => value,
+                _ => value
+            };
+        }
     }
 }
