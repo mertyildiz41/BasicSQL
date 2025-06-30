@@ -10,7 +10,9 @@ namespace BasicSQL.Models
         Integer,
         Long,
         Text,
-        Real
+        Real,
+        DateTime,
+        Decimal
     }
 
     /// <summary>
@@ -59,10 +61,12 @@ namespace BasicSQL.Models
             // Check data type compatibility
             return DataType switch
             {
-                DataType.Integer => value is int or long,
-                DataType.Long => value is int or long,
-                DataType.Real => value is float or double or decimal,
+                DataType.Integer => value is int or long or decimal or double or float,
+                DataType.Long => value is int or long or decimal or double or float,
+                DataType.Real => value is float or double or decimal or int or long,
                 DataType.Text => value is string,
+                DataType.DateTime => value is DateTime or string,
+                DataType.Decimal => value is decimal or double or float or int or long or string,
                 _ => false
             };
         }
@@ -83,6 +87,8 @@ namespace BasicSQL.Models
                     DataType.Long => Convert.ToInt64(value),
                     DataType.Real => Convert.ToDouble(value),
                     DataType.Text => value.ToString(),
+                    DataType.DateTime => value is DateTime dt ? dt : DateTime.Parse(value.ToString()!),
+                    DataType.Decimal => value is decimal d ? d : decimal.Parse(value.ToString()!),
                     _ => value
                 };
             }

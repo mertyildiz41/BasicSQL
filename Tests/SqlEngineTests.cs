@@ -58,8 +58,8 @@ namespace BasicSQL.Tests
             var insertResult = _engine.Execute(insertSql);
 
             // Assert
-            Assert.True(createResult.Success);
-            Assert.True(insertResult.Success);
+            Assert.True(createResult.Success, $"Create failed: {createResult.Message}");
+            Assert.True(insertResult.Success, $"Insert failed: {insertResult.Message}");
             Assert.Equal(1, insertResult.RowsAffected);
         }
 
@@ -237,6 +237,239 @@ namespace BasicSQL.Tests
             Assert.True(result.Success);
             Assert.Contains("users", result.Tables);
             Assert.Contains("products", result.Tables);
+        }
+
+        [Fact]
+        public void DateTime_CreateTableAndInsert_ShouldWorkCorrectly()
+        {
+            // Arrange
+            var createSql = "CREATE TABLE events (id INTEGER, name TEXT, event_date DATETIME, priority INTEGER)";
+            var insertSql = "INSERT INTO events (id, name, event_date, priority) VALUES (1, 'Test Event', '2024-01-15 09:00:00', 1)";
+
+            // Act
+            var createResult = _engine.Execute(createSql);
+            var insertResult = _engine.Execute(insertSql);
+
+            // Assert
+            Assert.True(createResult.Success, $"Create failed: {createResult.Message}");
+            Assert.True(insertResult.Success, $"Insert failed: {insertResult.Message}");
+        }
+
+        [Fact]
+        public void DateTime_SelectAfterInsert_ShouldReturnCorrectData()
+        {
+            // Arrange
+            var createSql = "CREATE TABLE events (id INTEGER, name TEXT, event_date DATETIME)";
+            var insertSql = "INSERT INTO events (id, name, event_date) VALUES (1, 'Test Event', '2024-01-15 09:00:00')";
+            var selectSql = "SELECT * FROM events";
+
+            // Act
+            _engine.Execute(createSql);
+            _engine.Execute(insertSql);
+            var selectResult = _engine.Execute(selectSql);
+
+            // Assert
+            Assert.True(selectResult.Success);
+            Assert.NotNull(selectResult.Rows);
+            Assert.Single(selectResult.Rows);
+            
+            var row = selectResult.Rows.First();
+            Assert.Equal(DateTime.Parse("2024-01-15 09:00:00"), row["event_date"]);
+        }
+
+        [Fact]
+        public void DateTime_UpdateOperation_ShouldWorkCorrectly()
+        {
+            // Arrange
+            var createSql = "CREATE TABLE events (id INTEGER, event_date DATETIME)";
+            var insertSql = "INSERT INTO events (id, event_date) VALUES (1, '2024-01-15 09:00:00')";
+            var updateSql = "UPDATE events SET event_date = '2024-02-15 10:30:00' WHERE id = 1";
+            var selectSql = "SELECT * FROM events WHERE id = 1";
+
+            // Act
+            _engine.Execute(createSql);
+            _engine.Execute(insertSql);
+            var updateResult = _engine.Execute(updateSql);
+            var selectResult = _engine.Execute(selectSql);
+
+            // Assert
+            Assert.True(updateResult.Success, $"Update failed: {updateResult.Message}");
+            Assert.True(selectResult.Success);
+            Assert.NotNull(selectResult.Rows);
+            Assert.Single(selectResult.Rows);
+            
+            var row = selectResult.Rows.First();
+            Assert.Equal(DateTime.Parse("2024-02-15 10:30:00"), row["event_date"]);
+        }
+
+        [Fact]
+        public void Decimal_CreateTableAndInsert_ShouldWorkCorrectly()
+        {
+            // Arrange
+            var createSql = "CREATE TABLE products (id INTEGER, name TEXT, price DECIMAL, cost DECIMAL)";
+            var insertSql = "INSERT INTO products (id, name, price, cost) VALUES (1, 'Laptop', 999.99, 650.50)";
+
+            // Act
+            var createResult = _engine.Execute(createSql);
+            var insertResult = _engine.Execute(insertSql);
+
+            // Assert
+            Assert.True(createResult.Success, $"Create failed: {createResult.Message}");
+            Assert.True(insertResult.Success, $"Insert failed: {insertResult.Message}");
+        }
+
+        [Fact]
+        public void Decimal_SelectAfterInsert_ShouldReturnCorrectData()
+        {
+            // Arrange
+            var createSql = "CREATE TABLE products (id INTEGER, name TEXT, price DECIMAL, cost DECIMAL)";
+            var insertSql = "INSERT INTO products (id, name, price, cost) VALUES (1, 'Laptop', 999.99, 650.50)";
+            var selectSql = "SELECT * FROM products";
+
+            // Act
+            _engine.Execute(createSql);
+            _engine.Execute(insertSql);
+            var selectResult = _engine.Execute(selectSql);
+
+            // Assert
+            Assert.True(selectResult.Success);
+            Assert.NotNull(selectResult.Rows);
+            Assert.Single(selectResult.Rows);
+            
+            var row = selectResult.Rows.First();
+            Assert.Equal(999.99m, row["price"]);
+            Assert.Equal(650.50m, row["cost"]);
+        }
+
+        [Fact]
+        public void Decimal_HighPrecisionValues_ShouldMaintainPrecision()
+        {
+            // Arrange
+            var createSql = "CREATE TABLE precision_test (id INTEGER, value DECIMAL)";
+            var highPrecisionValue = "123456789.123456789";
+            var insertSql = $"INSERT INTO precision_test (id, value) VALUES (1, {highPrecisionValue})";
+            var selectSql = "SELECT * FROM precision_test";
+
+            // Act
+            _engine.Execute(createSql);
+            _engine.Execute(insertSql);
+            var selectResult = _engine.Execute(selectSql);
+
+            // Assert
+            Assert.True(selectResult.Success);
+            Assert.NotNull(selectResult.Rows);
+            Assert.Single(selectResult.Rows);
+            
+            var row = selectResult.Rows.First();
+            var retrievedValue = (decimal)row["value"];
+            Assert.Equal(decimal.Parse(highPrecisionValue), retrievedValue);
+        }
+
+        [Fact]
+        public void Decimal_NegativeValues_ShouldWorkCorrectly()
+        {
+            // Arrange
+            var createSql = "CREATE TABLE accounting (id INTEGER, balance DECIMAL)";
+            var insertSql = "INSERT INTO accounting (id, balance) VALUES (1, -123.45)";
+            var selectSql = "SELECT * FROM accounting";
+
+            // Act
+            _engine.Execute(createSql);
+            _engine.Execute(insertSql);
+            var selectResult = _engine.Execute(selectSql);
+
+            // Assert
+            Assert.True(selectResult.Success);
+            Assert.NotNull(selectResult.Rows);
+            Assert.Single(selectResult.Rows);
+            
+            var row = selectResult.Rows.First();
+            Assert.Equal(-123.45m, row["balance"]);
+        }
+
+        [Fact]
+        public void Decimal_UpdateOperation_ShouldWorkCorrectly()
+        {
+            // Arrange
+            var createSql = "CREATE TABLE products (id INTEGER, price DECIMAL)";
+            var insertSql = "INSERT INTO products (id, price) VALUES (1, 100.00)";
+            var updateSql = "UPDATE products SET price = 150.75 WHERE id = 1";
+            var selectSql = "SELECT * FROM products WHERE id = 1";
+
+            // Act
+            _engine.Execute(createSql);
+            _engine.Execute(insertSql);
+            var updateResult = _engine.Execute(updateSql);
+            var selectResult = _engine.Execute(selectSql);
+
+            // Assert
+            Assert.True(updateResult.Success, $"Update failed: {updateResult.Message}");
+            Assert.True(selectResult.Success);
+            Assert.NotNull(selectResult.Rows);
+            Assert.Single(selectResult.Rows);
+            
+            var row = selectResult.Rows.First();
+            Assert.Equal(150.75m, row["price"]);
+        }
+
+        [Fact]
+        public void Mixed_DateTimeAndDecimal_ShouldWorkTogether()
+        {
+            // Arrange
+            var createSql = "CREATE TABLE transactions (id INTEGER, amount DECIMAL, transaction_date DATETIME, description TEXT)";
+            var insertSql = "INSERT INTO transactions (id, amount, transaction_date, description) VALUES (1, 1234.56, '2024-01-15 14:30:00', 'Test Transaction')";
+            var selectSql = "SELECT * FROM transactions";
+
+            // Act
+            _engine.Execute(createSql);
+            _engine.Execute(insertSql);
+            var selectResult = _engine.Execute(selectSql);
+
+            // Assert
+            Assert.True(selectResult.Success);
+            Assert.NotNull(selectResult.Rows);
+            Assert.Single(selectResult.Rows);
+            
+            var row = selectResult.Rows.First();
+            Assert.Equal(1234.56m, row["amount"]);
+            Assert.Equal(DateTime.Parse("2024-01-15 14:30:00"), row["transaction_date"]);
+            Assert.Equal("Test Transaction", row["description"]);
+        }
+
+        [Fact]
+        public void BinaryStorage_LargeDataSet_WithDateTimeAndDecimal_ShouldPerformWell()
+        {
+            // Arrange
+            var createSql = "CREATE TABLE performance_test (id INTEGER, price DECIMAL, created_date DATETIME, name TEXT)";
+            _engine.Execute(createSql);
+
+            // Act - Insert 1000 records
+            var insertCount = 1000;
+            for (int i = 1; i <= insertCount; i++)
+            {
+                var price = (decimal)(i * 1.5 + 0.99);
+                var date = DateTime.Now.AddDays(-i).ToString("yyyy-MM-dd HH:mm:ss");
+                var insertSql = $"INSERT INTO performance_test (id, price, created_date, name) VALUES ({i}, {price}, '{date}', 'Item {i}')";
+                var result = _engine.Execute(insertSql);
+                Assert.True(result.Success, $"Insert {i} failed: {result.Message}");
+            }
+
+            // Assert - Verify data integrity
+            var selectSql = "SELECT * FROM performance_test";
+            var selectResult = _engine.Execute(selectSql);
+            
+            Assert.True(selectResult.Success);
+            Assert.NotNull(selectResult.Rows);
+            Assert.Equal(insertCount, selectResult.Rows.Count());
+            
+            // Verify first and last records have correct data types
+            var firstRow = selectResult.Rows.First();
+            var lastRow = selectResult.Rows.Last();
+            
+            Assert.IsType<decimal>(firstRow["price"]);
+            Assert.IsType<DateTime>(firstRow["created_date"]);
+            Assert.IsType<decimal>(lastRow["price"]);
+            Assert.IsType<DateTime>(lastRow["created_date"]);
         }
 
         public void Dispose()

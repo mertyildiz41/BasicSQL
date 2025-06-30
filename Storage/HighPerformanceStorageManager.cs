@@ -24,6 +24,8 @@ namespace BasicSQL.Storage
         private const byte INTEGER_MARKER = 0x02;
         private const byte LONG_MARKER = 0x03;
         private const byte REAL_MARKER = 0x04;
+        private const byte DATETIME_MARKER = 0x05;
+        private const byte DECIMAL_MARKER = 0x06;
         private const byte NULL_MARKER = 0x00;
         private const byte ROW_SEPARATOR = 0xFF;
 
@@ -46,14 +48,6 @@ namespace BasicSQL.Storage
         public string GetTableDataFilePath(string tableName, int fileIndex)
         {
             return Path.Combine(_dataDirectory, $"{tableName}_data_{fileIndex:D6}.bin");
-        }
-
-        /// <summary>
-        /// Gets the CSV data file path for a table and file index (alternative format)
-        /// </summary>
-        public string GetTableCsvFilePath(string tableName, int fileIndex)
-        {
-            return Path.Combine(_dataDirectory, $"{tableName}_data_{fileIndex:D6}.csv");
         }
 
         /// <summary>
@@ -88,54 +82,6 @@ namespace BasicSQL.Storage
             catch (Exception ex)
             {
                 throw new InvalidOperationException($"Failed to append binary row to table '{tableName}': {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Appends a row using fast CSV format (human-readable alternative)
-        /// </summary>
-        public int AppendRowCsv(string tableName, Dictionary<string, object?> row, ScalableTableMetadata metadata)
-        {
-            var fileIndex = metadata.TotalRows / _rowsPerFile;
-            var filePath = GetTableCsvFilePath(tableName, fileIndex);
-            
-            try
-            {
-                using var stream = new FileStream(filePath, FileMode.Append, FileAccess.Write, FileShare.Read, _bufferSize);
-                using var writer = new StreamWriter(stream, Encoding.UTF8, _bufferSize);
-                
-                // Write header if file is new
-                if (metadata.TotalRows % _rowsPerFile == 0 && new FileInfo(filePath).Length == 0)
-                {
-                    var headers = string.Join(",", metadata.Columns.Select(c => c.Name));
-                    writer.WriteLine(headers);
-                }
-                
-                // Write CSV row
-                var values = new List<string>();
-                foreach (var column in metadata.Columns)
-                {
-                    if (row.TryGetValue(column.Name, out var value))
-                    {
-                        values.Add(EscapeCsvValue(value?.ToString() ?? ""));
-                    }
-                    else
-                    {
-                        values.Add("");
-                    }
-                }
-                
-                writer.WriteLine(string.Join(",", values));
-                
-                var rowId = metadata.TotalRows;
-                metadata.TotalRows++;
-                metadata.LastModified = DateTime.UtcNow;
-                
-                return rowId;
-            }
-            catch (Exception ex)
-            {
-                throw new InvalidOperationException($"Failed to append CSV row to table '{tableName}': {ex.Message}");
             }
         }
 
@@ -211,73 +157,6 @@ namespace BasicSQL.Storage
         }
 
         /// <summary>
-        /// Reads rows using fast CSV format
-        /// </summary>
-        public IEnumerable<(int rowId, Dictionary<string, object?>)> ReadRowsCsv(
-            string tableName, 
-            ScalableTableMetadata metadata,
-            int skip = 0, 
-            int take = int.MaxValue)
-        {
-            var rowsRead = 0;
-            var currentRowId = 0;
-
-            var startFileIndex = skip / _rowsPerFile;
-            var endFileIndex = Math.Min((skip + take - 1) / _rowsPerFile, (metadata.TotalRows - 1) / _rowsPerFile);
-
-            for (var fileIndex = startFileIndex; fileIndex <= endFileIndex && rowsRead < take; fileIndex++)
-            {
-                var filePath = GetTableCsvFilePath(tableName, fileIndex);
-                if (!File.Exists(filePath))
-                    continue;
-
-                var startRowInFile = fileIndex * _rowsPerFile;
-                var skipInFile = Math.Max(0, skip - startRowInFile);
-
-                using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, _bufferSize);
-                using var reader = new StreamReader(stream, Encoding.UTF8, bufferSize: _bufferSize);
-
-                // Skip header
-                reader.ReadLine();
-                
-                var rowsInFile = 0;
-                string? line;
-
-                while ((line = reader.ReadLine()) != null && rowsRead < take)
-                {
-                    currentRowId = startRowInFile + rowsInFile;
-                    
-                    if (rowsInFile < skipInFile)
-                    {
-                        rowsInFile++;
-                        continue;
-                    }
-
-                    if (rowsRead >= take)
-                        break;
-
-                    Dictionary<string, object?>? row = null;
-                    try
-                    {
-                        row = ParseCsvRow(line, metadata.Columns);
-                    }
-                    catch (Exception ex)
-                    {
-                        throw new InvalidOperationException($"Failed to parse CSV row {currentRowId} in table '{tableName}': {ex.Message}");
-                    }
-
-                    if (row != null)
-                    {
-                        yield return (currentRowId, row);
-                        rowsRead++;
-                    }
-
-                    rowsInFile++;
-                }
-            }
-        }
-
-        /// <summary>
         /// Writes a row in binary format (ultra-fast)
         /// </summary>
         private void WriteBinaryRow(Stream stream, Dictionary<string, object?> row, List<ColumnFileData> columns)
@@ -316,6 +195,25 @@ namespace BasicSQL.Storage
                         stream.WriteByte(REAL_MARKER);
                         var realBytes = BitConverter.GetBytes(Convert.ToDouble(value));
                         stream.Write(realBytes, 0, 8);
+                        break;
+
+                    case "DATETIME":
+                        stream.WriteByte(DATETIME_MARKER);
+                        var dateTimeValue = value is DateTime dt ? dt : Convert.ToDateTime(value);
+                        var tickBytes = BitConverter.GetBytes(dateTimeValue.Ticks);
+                        stream.Write(tickBytes, 0, 8);
+                        break;
+
+                    case "DECIMAL":
+                        stream.WriteByte(DECIMAL_MARKER);
+                        var decimalValue = value is decimal dec ? dec : Convert.ToDecimal(value);
+                        var decimalBits = decimal.GetBits(decimalValue);
+                        // Write all 4 32-bit integers that make up the decimal (16 bytes total)
+                        foreach (var bit in decimalBits)
+                        {
+                            var bitBytes = BitConverter.GetBytes(bit);
+                            stream.Write(bitBytes, 0, 4);
+                        }
                         break;
 
                     default:
@@ -369,6 +267,21 @@ namespace BasicSQL.Storage
                         row[column.Name] = reader.ReadDouble();
                         break;
 
+                    case DATETIME_MARKER:
+                        var ticks = reader.ReadInt64();
+                        row[column.Name] = new DateTime(ticks);
+                        break;
+
+                    case DECIMAL_MARKER:
+                        // Read 4 32-bit integers that make up the decimal (16 bytes total)
+                        var decimalBits = new int[4];
+                        for (int i = 0; i < 4; i++)
+                        {
+                            decimalBits[i] = reader.ReadInt32();
+                        }
+                        row[column.Name] = new decimal(decimalBits);
+                        break;
+
                     default:
                         throw new InvalidDataException($"Unknown binary marker: {marker}");
                 }
@@ -383,114 +296,22 @@ namespace BasicSQL.Storage
         }
 
         /// <summary>
-        /// Parses a CSV row into a dictionary
-        /// </summary>
-        private Dictionary<string, object?> ParseCsvRow(string csvLine, List<ColumnFileData> columns)
-        {
-            var values = ParseCsvLine(csvLine);
-            var row = new Dictionary<string, object?>();
-
-            for (int i = 0; i < columns.Count && i < values.Count; i++)
-            {
-                var column = columns[i];
-                var value = values[i];
-
-                if (string.IsNullOrEmpty(value))
-                {
-                    row[column.Name] = null;
-                    continue;
-                }
-
-                switch (column.DataType.ToUpper())
-                {
-                    case "INTEGER":
-                        row[column.Name] = int.TryParse(value, out var intVal) ? intVal : 0;
-                        break;
-                    case "LONG":
-                        row[column.Name] = long.TryParse(value, out var longVal) ? longVal : 0L;
-                        break;
-                    case "REAL":
-                        row[column.Name] = double.TryParse(value, out var doubleVal) ? doubleVal : 0.0;
-                        break;
-                    default:
-                        row[column.Name] = value;
-                        break;
-                }
-            }
-
-            return row;
-        }
-
-        /// <summary>
-        /// Fast CSV line parser
-        /// </summary>
-        private List<string> ParseCsvLine(string line)
-        {
-            var values = new List<string>();
-            var current = new StringBuilder();
-            var inQuotes = false;
-
-            for (int i = 0; i < line.Length; i++)
-            {
-                var ch = line[i];
-
-                if (ch == '"')
-                {
-                    inQuotes = !inQuotes;
-                }
-                else if (ch == ',' && !inQuotes)
-                {
-                    values.Add(current.ToString());
-                    current.Clear();
-                }
-                else
-                {
-                    current.Append(ch);
-                }
-            }
-
-            values.Add(current.ToString());
-            return values;
-        }
-
-        /// <summary>
-        /// Escapes CSV values
-        /// </summary>
-        private string EscapeCsvValue(string value)
-        {
-            if (string.IsNullOrEmpty(value))
-                return "";
-
-            if (value.Contains(",") || value.Contains("\"") || value.Contains("\n"))
-            {
-                return $"\"{value.Replace("\"", "\"\"")}\"";
-            }
-
-            return value;
-        }
-
-        /// <summary>
         /// Gets performance statistics for a table
         /// </summary>
         public Dictionary<string, object> GetPerformanceStats(string tableName, ScalableTableMetadata metadata)
         {
             var binaryFiles = Directory.GetFiles(_dataDirectory, $"{tableName}_data_*.bin");
-            var csvFiles = Directory.GetFiles(_dataDirectory, $"{tableName}_data_*.csv");
             
             var binarySize = binaryFiles.Sum(f => new FileInfo(f).Length);
-            var csvSize = csvFiles.Sum(f => new FileInfo(f).Length);
 
             return new Dictionary<string, object>
             {
                 ["TableName"] = tableName,
                 ["TotalRows"] = metadata.TotalRows,
                 ["BinaryFiles"] = binaryFiles.Length,
-                ["CsvFiles"] = csvFiles.Length,
                 ["BinarySizeBytes"] = binarySize,
-                ["CsvSizeBytes"] = csvSize,
                 ["BinarySizeMB"] = binarySize / (1024.0 * 1024.0),
-                ["CsvSizeMB"] = csvSize / (1024.0 * 1024.0),
-                ["CompressionRatio"] = csvSize > 0 ? (double)binarySize / csvSize : 0,
+                ["CompressionRatio"] = 1.0, // Binary is the primary format
                 ["RowsPerFile"] = _rowsPerFile,
                 ["BufferSizeKB"] = _bufferSize / 1024
             };
@@ -543,13 +364,13 @@ namespace BasicSQL.Storage
             if (!Directory.Exists(_metaDirectory))
                 return tableNames;
 
-            var metadataFiles = Directory.GetFiles(_metaDirectory, "*.json");
+            var metadataFiles = Directory.GetFiles(_metaDirectory, "*_meta.json");
             foreach (var file in metadataFiles)
             {
                 var fileName = Path.GetFileNameWithoutExtension(file);
-                if (fileName.EndsWith("_metadata"))
+                if (fileName.EndsWith("_meta"))
                 {
-                    var tableName = fileName.Substring(0, fileName.Length - "_metadata".Length);
+                    var tableName = fileName.Substring(0, fileName.Length - "_meta".Length);
                     tableNames.Add(tableName);
                 }
             }
@@ -571,10 +392,6 @@ namespace BasicSQL.Storage
             var dataFiles = Directory.GetFiles(_dataDirectory, $"{tableName}_data_*.bin");
             foreach (var file in dataFiles)
                 File.Delete(file);
-                
-            var csvFiles = Directory.GetFiles(_dataDirectory, $"{tableName}_data_*.csv");
-            foreach (var file in csvFiles)
-                File.Delete(file);
         }
 
         /// <summary>
@@ -582,121 +399,7 @@ namespace BasicSQL.Storage
         /// </summary>
         public string GetTableMetadataFilePath(string tableName)
         {
-            return Path.Combine(_metaDirectory, $"{tableName}_metadata.json");
-        }
-
-        /// <summary>
-        /// Performs efficient batch update/delete operations using a streaming approach
-        /// Returns the number of rows that were modified or deleted
-        /// </summary>
-        public int ProcessRowsBatch(string tableName, ScalableTableMetadata metadata, 
-            Func<Dictionary<string, object?>, bool> shouldUpdate, 
-            Func<Dictionary<string, object?>, Dictionary<string, object?>>? updateFunction = null)
-        {
-            var tempDir = Path.Combine(Path.GetTempPath(), $"sql_temp_{Guid.NewGuid():N}");
-            Directory.CreateDirectory(tempDir);
-            
-            try
-            {
-                var totalFiles = (metadata.TotalRows + _rowsPerFile - 1) / _rowsPerFile;
-                var newTotalRows = 0;
-                var hasChanges = false;
-                var modifiedRowCount = 0;
-
-                // Process each file
-                for (int fileIndex = 0; fileIndex < totalFiles; fileIndex++)
-                {
-                    var sourceFilePath = GetTableCsvFilePath(tableName, fileIndex);
-                    if (!File.Exists(sourceFilePath)) continue;
-
-                    var tempFilePath = Path.Combine(tempDir, $"temp_{fileIndex:D6}.csv");
-                    var fileHasChanges = false;
-                    var rowsInThisFile = 0;
-
-                    using (var reader = new StreamReader(sourceFilePath, Encoding.UTF8))
-                    using (var writer = new StreamWriter(tempFilePath, false, Encoding.UTF8, _bufferSize))
-                    {
-                        // Copy header
-                        var header = reader.ReadLine();
-                        if (header != null)
-                        {
-                            writer.WriteLine(header);
-                        }
-
-                        string line;
-                        while ((line = reader.ReadLine()) != null)
-                        {
-                            var row = ParseCsvRow(line, metadata.Columns);
-                            
-                            if (shouldUpdate(row))
-                            {
-                                modifiedRowCount++;
-                                if (updateFunction != null)
-                                {
-                                    // Update operation
-                                    var updatedRow = updateFunction(row);
-                                    var csvLine = CreateCsvLine(updatedRow, metadata.Columns);
-                                    writer.WriteLine(csvLine);
-                                    rowsInThisFile++;
-                                    fileHasChanges = true;
-                                }
-                                // If updateFunction is null, this is a delete operation - skip writing the row
-                                else
-                                {
-                                    fileHasChanges = true;
-                                    // Don't write the row (delete it)
-                                }
-                            }
-                            else
-                            {
-                                // Row doesn't match criteria - keep it unchanged
-                                writer.WriteLine(line);
-                                rowsInThisFile++;
-                            }
-                        }
-                    }
-
-                    if (fileHasChanges)
-                    {
-                        hasChanges = true;
-                    }
-
-                    newTotalRows += rowsInThisFile;
-
-                    // Only move temp file if we have rows or this is the first file (to preserve header)
-                    if (rowsInThisFile > 0 || fileIndex == 0)
-                    {
-                        // Delete the original file first to avoid "file already exists" error
-                        if (File.Exists(sourceFilePath))
-                        {
-                            File.Delete(sourceFilePath);
-                        }
-                        File.Move(tempFilePath, sourceFilePath);
-                    }
-                    else if (File.Exists(sourceFilePath))
-                    {
-                        // Remove empty file
-                        File.Delete(sourceFilePath);
-                    }
-                }
-
-                if (hasChanges)
-                {
-                    metadata.TotalRows = newTotalRows;
-                    metadata.LastModified = DateTime.UtcNow;
-                    SaveTableMetadata(tableName, metadata);
-                }
-                
-                return modifiedRowCount;
-            }
-            finally
-            {
-                // Clean up temp directory
-                if (Directory.Exists(tempDir))
-                {
-                    Directory.Delete(tempDir, true);
-                }
-            }
+            return Path.Combine(_metaDirectory, $"{tableName}_meta.json");
         }
 
         /// <summary>
@@ -868,6 +571,25 @@ namespace BasicSQL.Storage
                             row[column.Name] = BitConverter.ToDouble(doubleBytes, 0);
                             break;
                             
+                        case DATETIME_MARKER:
+                            var tickBytes = new byte[8];
+                            if (stream.Read(tickBytes, 0, 8) != 8) return null;
+                            var ticks = BitConverter.ToInt64(tickBytes, 0);
+                            row[column.Name] = new DateTime(ticks);
+                            break;
+                            
+                        case DECIMAL_MARKER:
+                            // Read 4 32-bit integers that make up the decimal (16 bytes total)
+                            var decimalBits = new int[4];
+                            for (int i = 0; i < 4; i++)
+                            {
+                                var decimalIntBytes = new byte[4];
+                                if (stream.Read(decimalIntBytes, 0, 4) != 4) return null;
+                                decimalBits[i] = BitConverter.ToInt32(decimalIntBytes, 0);
+                            }
+                            row[column.Name] = new decimal(decimalBits);
+                            break;
+                            
                         default:
                             throw new InvalidOperationException($"Unknown binary marker: {marker}");
                     }
@@ -890,67 +612,6 @@ namespace BasicSQL.Storage
         }
 
         /// <summary>
-        /// Creates a CSV line from a row dictionary
-        /// </summary>
-        private string CreateCsvLine(Dictionary<string, object?> row, List<ColumnFileData> columns)
-        {
-            var values = new List<string>();
-            foreach (var column in columns)
-            {
-                if (row.TryGetValue(column.Name, out var value))
-                {
-                    values.Add(EscapeCsvValue(value?.ToString() ?? ""));
-                }
-                else
-                {
-                    values.Add("");
-                }
-            }
-            return string.Join(",", values);
-        }
-
-        /// <summary>
-        /// Parses CSV values from a line, handling quoted values
-        /// </summary>
-        private List<string> ParseCsvValues(string csvLine)
-        {
-            var values = new List<string>();
-            var current = new StringBuilder();
-            var inQuotes = false;
-            
-            for (int i = 0; i < csvLine.Length; i++)
-            {
-                var ch = csvLine[i];
-                
-                if (ch == '"')
-                {
-                    if (inQuotes && i + 1 < csvLine.Length && csvLine[i + 1] == '"')
-                    {
-                        // Escaped quote
-                        current.Append('"');
-                        i++; // Skip next quote
-                    }
-                    else
-                    {
-                        inQuotes = !inQuotes;
-                    }
-                }
-                else if (ch == ',' && !inQuotes)
-                {
-                    values.Add(current.ToString());
-                    current.Clear();
-                }
-                else
-                {
-                    current.Append(ch);
-                }
-            }
-            
-            values.Add(current.ToString());
-            return values;
-        }
-
-        /// <summary>
         /// Converts a string value to the appropriate type
         /// </summary>
         private object? ConvertValue(string value, string type)
@@ -962,6 +623,8 @@ namespace BasicSQL.Storage
                 "INTEGER" or "INT" => int.TryParse(value, out var intVal) ? intVal : null,
                 "BIGINT" or "LONG" => long.TryParse(value, out var longVal) ? longVal : null,
                 "REAL" or "FLOAT" or "DOUBLE" => double.TryParse(value, out var doubleVal) ? doubleVal : null,
+                "DECIMAL" or "MONEY" or "NUMERIC" => decimal.TryParse(value, out var decimalVal) ? decimalVal : null,
+                "DATETIME" => DateTime.TryParse(value, out var dateVal) ? dateVal : null,
                 "TEXT" or "STRING" or "VARCHAR" => value,
                 _ => value
             };

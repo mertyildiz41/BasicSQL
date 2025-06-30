@@ -314,7 +314,7 @@ namespace BasicSQL.Parsers
         }
 
         /// <summary>
-        /// Parses a single value (string, number, or null)
+        /// Parses a single value (string, number, datetime, decimal, or null)
         /// </summary>
         private static object? ParseSingleValue(string valueString)
         {
@@ -323,14 +323,43 @@ namespace BasicSQL.Parsers
             if (string.Equals(trimmed, "NULL", StringComparison.OrdinalIgnoreCase))
                 return null;
 
+            // Handle quoted strings
             if (trimmed.StartsWith("'") && trimmed.EndsWith("'") && trimmed.Length >= 2)
-                return trimmed.Substring(1, trimmed.Length - 2);
+            {
+                var stringValue = trimmed.Substring(1, trimmed.Length - 2);
+                
+                // Try to parse as DateTime first (common format: 'YYYY-MM-DD HH:MM:SS')
+                if (DateTime.TryParse(stringValue, out var dateTimeValue))
+                    return dateTimeValue;
+                
+                // Try to parse as decimal if it looks numeric
+                if (decimal.TryParse(stringValue, out var quotedDecimalValue))
+                    return quotedDecimalValue;
+                
+                // Return as string
+                return stringValue;
+            }
 
+            // Try to parse unquoted numeric values in order of specificity
+            // Try int first (most specific)
             if (int.TryParse(trimmed, out var intValue))
                 return intValue;
 
+            // Try long next
+            if (long.TryParse(trimmed, out var longValue))
+                return longValue;
+
+            // Try decimal (more specific than double)
+            if (decimal.TryParse(trimmed, out var decimalValue))
+                return decimalValue;
+
+            // Try double
             if (double.TryParse(trimmed, out var doubleValue))
                 return doubleValue;
+
+            // Try to parse as DateTime for unquoted values (less common but possible)
+            if (DateTime.TryParse(trimmed, out var unquotedDateTimeValue))
+                return unquotedDateTimeValue;
 
             return trimmed;
         }

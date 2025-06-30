@@ -32,7 +32,7 @@ namespace BasicSQL.Core
             var tableNames = _storageManager.GetTableNames();
             foreach (var tableName in tableNames)
             {
-                var table = HighPerformanceTable.LoadFromStorage(tableName, _storageManager, useBinaryFormat: true);
+                var table = HighPerformanceTable.LoadFromStorage(tableName, _storageManager);
                 if (table != null)
                     _tables[tableName] = table;
             }
@@ -101,7 +101,7 @@ namespace BasicSQL.Core
                 if (_tables.ContainsKey(tableName))
                     return SqlResult.CreateError($"Table '{tableName}' already exists");
 
-                var table = new HighPerformanceTable(tableName, columns, _storageManager, useBinaryFormat: true);
+                var table = new HighPerformanceTable(tableName, columns, _storageManager);
                 _tables[tableName] = table;
 
                 return SqlResult.CreateSuccess($"Table '{tableName}' created successfully with binary storage");
@@ -169,9 +169,21 @@ namespace BasicSQL.Core
             {
                 var sql = string.Join(" ", tokens);
                 var query = SqlParser.ParseSelect(sql);
-                
                 if (!_tables.TryGetValue(query.TableName, out var table))
                     return SqlResult.CreateError($"Table '{query.TableName}' does not exist");
+
+                // COUNT with WHERE support: SELECT COUNT FROM users WHERE ...
+                if (query.Columns.Count == 1 && (string.Equals(query.Columns[0], "COUNT", StringComparison.OrdinalIgnoreCase) || string.Equals(query.Columns[0], "COUNT(*)", StringComparison.OrdinalIgnoreCase)))
+                {
+                    Func<Dictionary<string, object?>, bool>? countPredicate = null;
+                    if (!string.IsNullOrEmpty(query.WhereClause))
+                    {
+                        countPredicate = CreateSimplePredicate(query.WhereClause, table.Columns);
+                    }
+                    var count = table.SelectRows(predicate: countPredicate).Count();
+                    var resultRow = new Dictionary<string, object?> { { "COUNT", count } };
+                    return SqlResult.CreateQueryResult(new List<string> { "COUNT" }, new List<Dictionary<string, object?>> { resultRow });
+                }
 
                 // Simple predicate creation - for now just basic equality conditions
                 Func<Dictionary<string, object?>, bool>? predicate = null;

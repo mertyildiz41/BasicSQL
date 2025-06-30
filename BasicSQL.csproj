@@ -13,6 +13,9 @@
 
   <ItemGroup>
     <Compile Remove="Tests/**/*" />
+    <Compile Remove="WebIDE/**/*" />
+    <Compile Remove="BasicSQL.EntityFramework/**/*" />
+    <Compile Remove="BasicSQL.EntityFramework.Tests/**/*" />
   </ItemGroup>
 
 </Project>

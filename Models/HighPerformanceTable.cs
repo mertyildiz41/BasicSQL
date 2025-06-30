@@ -14,7 +14,6 @@ namespace BasicSQL.Models
     {
         private readonly HighPerformanceStorageManager _storageManager;
         private ScalableTableMetadata _metadata;
-        private readonly bool _useBinaryFormat;
 
         public string Name => _metadata.TableName;
         public List<Column> Columns { get; private set; } = new List<Column>();
@@ -22,10 +21,9 @@ namespace BasicSQL.Models
         public bool HasPrimaryKey => _metadata.HasPrimaryKey;
         public long EstimatedSizeBytes => _metadata.EstimatedSizeBytes;
 
-        public HighPerformanceTable(string tableName, List<Column> columns, HighPerformanceStorageManager storageManager, bool useBinaryFormat = true)
+        public HighPerformanceTable(string tableName, List<Column> columns, HighPerformanceStorageManager storageManager)
         {
             _storageManager = storageManager;
-            _useBinaryFormat = useBinaryFormat;
             
             // Initialize metadata
             _metadata = new ScalableTableMetadata
@@ -52,24 +50,23 @@ namespace BasicSQL.Models
         /// <summary>
         /// Loads an existing table from storage
         /// </summary>
-        public static HighPerformanceTable? LoadFromStorage(string tableName, HighPerformanceStorageManager storageManager, bool useBinaryFormat = true)
+        public static HighPerformanceTable? LoadFromStorage(string tableName, HighPerformanceStorageManager storageManager)
         {
             var metadata = storageManager.LoadTableMetadata(tableName);
             if (metadata == null)
                 return null;
 
-            var table = new HighPerformanceTable(storageManager, metadata, useBinaryFormat);
+            var table = new HighPerformanceTable(storageManager, metadata);
             return table;
         }
 
         /// <summary>
         /// Private constructor for loading from storage
         /// </summary>
-        private HighPerformanceTable(HighPerformanceStorageManager storageManager, ScalableTableMetadata metadata, bool useBinaryFormat)
+        private HighPerformanceTable(HighPerformanceStorageManager storageManager, ScalableTableMetadata metadata)
         {
             _storageManager = storageManager;
             _metadata = metadata;
-            _useBinaryFormat = useBinaryFormat;
 
             // Ensure AutoIncrementValues is initialized if missing
             if (_metadata.AutoIncrementValues == null)
@@ -170,15 +167,7 @@ namespace BasicSQL.Models
             }
 
             // Use high-performance storage
-            int actualRowId;
-            if (_useBinaryFormat)
-            {
-                actualRowId = _storageManager.AppendRowBinary(_metadata.TableName, validatedRow, _metadata);
-            }
-            else
-            {
-                actualRowId = _storageManager.AppendRowCsv(_metadata.TableName, validatedRow, _metadata);
-            }
+            int actualRowId = _storageManager.AppendRowBinary(_metadata.TableName, validatedRow, _metadata);
 
             // Update metadata every 1000 rows for better performance
             if (_metadata.TotalRows % 1000 == 0)
@@ -205,15 +194,7 @@ namespace BasicSQL.Models
 
             // Stream rows from high-performance storage
             IEnumerable<(int rowId, Dictionary<string, object?>)> rowStream;
-            
-            if (_useBinaryFormat)
-            {
-                rowStream = _storageManager.ReadRowsBinary(_metadata.TableName, _metadata, skip, actualLimit);
-            }
-            else
-            {
-                rowStream = _storageManager.ReadRowsCsv(_metadata.TableName, _metadata, skip, actualLimit);
-            }
+            rowStream = _storageManager.ReadRowsBinary(_metadata.TableName, _metadata, skip, actualLimit);
 
             foreach (var (rowId, row) in rowStream)
             {
@@ -239,7 +220,7 @@ namespace BasicSQL.Models
         {
             var baseStats = _storageManager.GetPerformanceStats(_metadata.TableName, _metadata);
             
-            baseStats["StorageFormat"] = _useBinaryFormat ? "Binary" : "CSV";
+            baseStats["StorageFormat"] = "Binary";
             baseStats["HasPrimaryKey"] = _metadata.HasPrimaryKey;
             baseStats["PrimaryKeyColumn"] = _metadata.PrimaryKeyColumn;
             baseStats["AutoIncrementColumns"] = _metadata.AutoIncrementValues.Keys.ToList();
@@ -295,7 +276,6 @@ namespace BasicSQL.Models
             Console.WriteLine("=" + new string('=', 70));
 
             var binaryStorage = new HighPerformanceStorageManager("perf_test_binary", 10000, 4 * 1024 * 1024);
-            var csvStorage = new HighPerformanceStorageManager("perf_test_csv", 10000, 4 * 1024 * 1024);
 
             var columns = new List<Column>
             {
@@ -305,32 +285,20 @@ namespace BasicSQL.Models
             };
 
             Console.WriteLine("\n📊 Testing Binary Format:");
-            var binaryTable = new HighPerformanceTable("perf_binary", columns, binaryStorage, useBinaryFormat: true);
+            var binaryTable = new HighPerformanceTable("perf_binary", columns, binaryStorage);
             var binaryInsertTime = TestInsertPerformance(binaryTable, recordCount);
             var binarySelectTime = TestSelectPerformance(binaryTable, recordCount / 10);
             var binaryStats = binaryTable.GetPerformanceStats();
 
-            Console.WriteLine("\n📄 Testing CSV Format:");
-            var csvTable = new HighPerformanceTable("perf_csv", columns, csvStorage, useBinaryFormat: false);
-            var csvInsertTime = TestInsertPerformance(csvTable, recordCount);
-            var csvSelectTime = TestSelectPerformance(csvTable, recordCount / 10);
-            var csvStats = csvTable.GetPerformanceStats();
-
             Console.WriteLine("\n📈 Performance Results:");
             Console.WriteLine($"   Insert Performance:");
             Console.WriteLine($"     Binary: {binaryInsertTime.TotalSeconds:F2}s ({recordCount / binaryInsertTime.TotalSeconds:F0} records/sec)");
-            Console.WriteLine($"     CSV:    {csvInsertTime.TotalSeconds:F2}s ({recordCount / csvInsertTime.TotalSeconds:F0} records/sec)");
-            Console.WriteLine($"     Improvement: {csvInsertTime.TotalMilliseconds / binaryInsertTime.TotalMilliseconds:F1}x faster");
 
             Console.WriteLine($"\n   Select Performance:");
             Console.WriteLine($"     Binary: {binarySelectTime.TotalSeconds:F2}s");
-            Console.WriteLine($"     CSV:    {csvSelectTime.TotalSeconds:F2}s");
-            Console.WriteLine($"     Improvement: {csvSelectTime.TotalMilliseconds / binarySelectTime.TotalMilliseconds:F1}x faster");
 
             Console.WriteLine($"\n   Storage Efficiency:");
             Console.WriteLine($"     Binary: {binaryStats["BinarySizeMB"]:F1} MB");
-            Console.WriteLine($"     CSV:    {csvStats["CsvSizeMB"]:F1} MB");
-            Console.WriteLine($"     Space Savings: {(double)csvStats["CsvSizeMB"] / (double)binaryStats["BinarySizeMB"]:F1}x more compact");
         }
 
         private static TimeSpan TestInsertPerformance(HighPerformanceTable table, int recordCount)
@@ -378,41 +346,8 @@ namespace BasicSQL.Models
         {
             try
             {
-                if (_useBinaryFormat)
-                {
-                    // Use efficient binary processing for better performance
-                    return UpdateRowsBinary(updates, predicate);
-                }
-                else
-                {
-                    // Use the new CSV batch processing method for CSV format
-                    return _storageManager.ProcessRowsBatch(
-                        _metadata.TableName,
-                        _metadata,
-                        row => predicate == null || predicate(row),
-                        row =>
-                        {
-                            // Apply updates to this row
-                            var updatedRow = new Dictionary<string, object?>(row);
-                            foreach (var (columnName, newValue) in updates)
-                            {
-                                if (updatedRow.ContainsKey(columnName))
-                                {
-                                    var column = Columns.FirstOrDefault(c => c.Name == columnName);
-                                    if (column != null)
-                                    {
-                                        updatedRow[columnName] = column.ConvertValue(newValue);
-                                    }
-                                    else
-                                    {
-                                        updatedRow[columnName] = newValue;
-                                    }
-                                }
-                            }
-                            return updatedRow;
-                        }
-                    );
-                }
+                // Use efficient binary processing for better performance
+                return UpdateRowsBinary(updates, predicate);
             }
             catch (Exception ex)
             {
@@ -519,21 +454,8 @@ namespace BasicSQL.Models
                     return totalRows;
                 }
                 
-                if (_useBinaryFormat)
-                {
-                    // Use efficient binary processing
-                    return DeleteRowsBinary(predicate);
-                }
-                else
-                {
-                    // Use the new CSV batch processing method for CSV format
-                    return _storageManager.ProcessRowsBatch(
-                        _metadata.TableName,
-                        _metadata,
-                        row => predicate(row),  // Identify rows to delete
-                        null  // null updateFunction means delete the row
-                    );
-                }
+                // Use efficient binary processing
+                return DeleteRowsBinary(predicate);
             }
             catch (Exception ex)
             {
@@ -678,15 +600,7 @@ namespace BasicSQL.Models
                 }
             }
 
-            // Store the row
-            if (_useBinaryFormat)
-            {
-                _storageManager.AppendRowBinary(_metadata.TableName, validatedRow, _metadata);
-            }
-            else
-            {
-                _storageManager.AppendRowCsv(_metadata.TableName, validatedRow, _metadata);
-            }
+            _storageManager.AppendRowBinary(_metadata.TableName, validatedRow, _metadata);
 
             _metadata.TotalRows++;
             _metadata.LastModified = DateTime.UtcNow;

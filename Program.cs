@@ -11,6 +11,41 @@ namespace BasicSQL
     {
         static void Main(string[] args)
         {
+            // Start TCP server for remote SQL access (default port 4162)
+            int port = 4162;
+            var portEnv = Environment.GetEnvironmentVariable("BASICSQL_PORT");
+            if (!string.IsNullOrEmpty(portEnv) && int.TryParse(portEnv, out int envPort))
+                port = envPort;
+
+            // Always load from the persistent data directory
+            var engine = new BinarySqlEngine("binary_data");
+            var tcpServer = new Core.SqlTcpServer(port, sql =>
+            {
+                try
+                {
+                    var result = engine.Execute(sql);
+                    if (!result.Success)
+                        return $"ERROR: {result.ErrorMessage}";
+                    if (result.IsQueryResult)
+                    {
+                        var sb = new System.Text.StringBuilder();
+                        sb.AppendLine(string.Join("\t", result.Columns));
+                        foreach (var row in result.Rows)
+                            sb.AppendLine(string.Join("\t", result.Columns.Select(c => row.GetValueOrDefault(c)?.ToString() ?? "NULL")));
+                        return sb.ToString();
+                    }
+                    if (result.IsTableListResult)
+                        return $"Tables: {string.Join(", ", result.Tables)}";
+                    return result.Message;
+                }
+                catch (Exception ex)
+                {
+                    return $"ERROR: {ex.Message}";
+                }
+            });
+            tcpServer.Start();
+            Console.WriteLine($"[BasicSQL] TCP server started on port {port}");
+
             if (args.Length > 0)
             {
                 // Run in batch mode with provided arguments
