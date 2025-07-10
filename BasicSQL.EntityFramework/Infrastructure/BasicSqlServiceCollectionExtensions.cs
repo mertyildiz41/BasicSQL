@@ -3,11 +3,15 @@ using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.EntityFrameworkCore.Update;
+using Microsoft.EntityFrameworkCore.Update.Internal;
 using Microsoft.EntityFrameworkCore.ValueGeneration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using BasicSQL.EntityFramework.Diagnostics;
 using BasicSQL.EntityFramework.Storage;
 using BasicSQL.EntityFramework.Update;
+using System;
+using System.Linq;
 
 namespace BasicSQL.EntityFramework.Infrastructure
 {
@@ -31,13 +35,24 @@ namespace BasicSQL.EntityFramework.Infrastructure
                     var options = p.GetRequiredService<IDbContextOptions>();
                     var ext = options.Extensions.OfType<BasicSqlOptionsExtension>().FirstOrDefault();
                     var connStr = ext?.ConnectionString ?? string.Empty;
-                    if (connStr.ToLower().Contains("mode=socket"))
+                    
+                    // Check if the connection string indicates socket mode
+                    var isSocketMode = connStr.Contains("mode=socket", StringComparison.OrdinalIgnoreCase) ||
+                                     connStr.Contains("host=", StringComparison.OrdinalIgnoreCase);
+                    
+                    if (isSocketMode)
+                    {
                         return new BasicSQL.EntityFramework.Storage.BasicSqlSocketRelationalConnection(p.GetRequiredService<RelationalConnectionDependencies>());
-                    return new BasicSqlRelationalConnection(p.GetRequiredService<RelationalConnectionDependencies>());
+                    }
+                    else
+                    {
+                        return new BasicSQL.EntityFramework.Storage.BasicSqlRelationalConnection(p.GetRequiredService<RelationalConnectionDependencies>());
+                    }
                 })
                 .TryAdd<ISqlGenerationHelper, BasicSqlSqlGenerationHelper>()
                 .TryAdd<IRelationalTypeMappingSource, BasicSqlTypeMappingSource>()
                 .TryAdd<IModificationCommandBatchFactory, BasicSqlModificationCommandBatchFactory>()
+                .TryAdd<ICommandBatchPreparer, BasicSqlCommandBatchPreparer>()
                 .TryAdd<IUpdateSqlGenerator, BasicSqlUpdateSqlGenerator>()
                 .TryAdd<IRelationalDatabaseCreator, BasicSqlDatabaseCreator>()
                 .TryAdd<IValueGeneratorSelector, BasicSqlValueGeneratorSelector>();

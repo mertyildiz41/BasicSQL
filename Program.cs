@@ -19,6 +19,8 @@ namespace BasicSQL
 
             // Always load from the persistent data directory
             var engine = new BinarySqlEngine("binary_data");
+            var authManager = new AuthenticationManager(engine);
+
             var tcpServer = new Core.SqlTcpServer(port, sql =>
             {
                 try
@@ -42,14 +44,28 @@ namespace BasicSQL
                 {
                     return $"ERROR: {ex.Message}";
                 }
-            });
-            tcpServer.Start();
-            Console.WriteLine($"[BasicSQL] TCP server started on port {port}");
+            }, authManager);
+            
+            // Check if we're running in batch mode that doesn't need TCP server
+            bool skipTcpServer = args.Length > 0 && 
+                (args[0].ToLower() == "--benchmark" || args[0].ToLower() == "--benchmark-update-delete" || args[0].ToLower() == "-b" ||
+                 args[0].ToLower() == "--scalability" || args[0].ToLower() == "-s" ||
+                 args[0].ToLower() == "--quick-scalability" || args[0].ToLower() == "-qs" ||
+                 args[0].ToLower() == "--performance" || args[0].ToLower() == "-p" ||
+                 args[0].ToLower() == "--demo" || args[0].ToLower() == "-d" ||
+                 args[0].ToLower() == "--help" || args[0].ToLower() == "-h" ||
+                 args[0].ToLower() == "--file" || args[0].ToLower() == "-f");
+            
+            if (!skipTcpServer)
+            {
+                tcpServer.Start();
+                Console.WriteLine($"[BasicSQL] TCP server started on port {port}");
+            }
 
             if (args.Length > 0)
             {
                 // Run in batch mode with provided arguments
-                RunBatchMode(args);
+                RunBatchMode(args, authManager);
             }
             else
             {
@@ -78,9 +94,9 @@ namespace BasicSQL
         /// <summary>
         /// Runs the program in batch mode with command line arguments
         /// </summary>
-        private static void RunBatchMode(string[] args)
+        private static void RunBatchMode(string[] args, AuthenticationManager authManager)
         {
-            var engine = new BinarySqlEngine(); // Use ultra-fast binary engine (no JSON)
+            var engine = authManager.GetEngine(); // Use the same engine as the auth manager
             
             // Handle command line options
             for (int i = 0; i < args.Length; i++)
@@ -89,6 +105,34 @@ namespace BasicSQL
                 
                 switch (arg.ToLower())
                 {
+                    case "--create-user":
+                        if (i + 2 < args.Length)
+                        {
+                            var username = args[i + 1];
+                            var password = args[i + 2];
+                            var role = "user"; // default role
+                            if (i + 3 < args.Length && !args[i + 3].StartsWith("--"))
+                            {
+                                role = args[i + 3];
+                                i++; // consume role argument
+                            }
+
+                            if (authManager.CreateUser(username, password, role))
+                            {
+                                Console.WriteLine($"User '{username}' with role '{role}' created successfully.");
+                            }
+                            else
+                            {
+                                Console.WriteLine($"Error: Could not create user '{username}'.");
+                            }
+                            i += 2; // Skip username and password args
+                        }
+                        else
+                        {
+                            Console.WriteLine("Usage: --create-user <username> <password> [role]");
+                        }
+                        break;
+
                     case "--demo":
                     case "-d":
                         RunDemo(engine);
@@ -313,6 +357,7 @@ namespace BasicSQL
             Console.WriteLine("  BasicSQL --benchmark           Run UPDATE/DELETE performance benchmark");
             Console.WriteLine("  BasicSQL --scalability         Run scalability test (1M records)");
             Console.WriteLine("  BasicSQL --quick-scalability   Run quick scalability test (100K records)");
+            Console.WriteLine("  BasicSQL --create-user <user> <pass> Create a new user");
             Console.WriteLine("  BasicSQL --file <filename>     Execute SQL file");
             Console.WriteLine("  BasicSQL --help                Show this help");
             Console.WriteLine();

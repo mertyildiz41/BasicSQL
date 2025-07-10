@@ -56,12 +56,16 @@ namespace BasicSQL.EntityFramework.Storage
             {
                 // Extract the database path from the connection string
                 var connectionString = _connection.ConnectionString ?? "";
+                Console.WriteLine($"DbCommand: Connection string = '{connectionString}'");
+                
                 if (string.IsNullOrEmpty(connectionString))
                 {
                     throw new InvalidOperationException("Connection string is null or empty");
                 }
                 
                 var dataSource = ExtractDataSource(connectionString);
+                Console.WriteLine($"DbCommand: Extracted data source = '{dataSource}'");
+                
                 if (string.IsNullOrEmpty(dataSource))
                 {
                     throw new InvalidOperationException($"Could not determine database path from connection string: '{connectionString}'");
@@ -69,6 +73,7 @@ namespace BasicSQL.EntityFramework.Storage
 
                 // Create BasicSQL engine instance
                 var engine = new BinarySqlEngine(dataSource);
+                Console.WriteLine($"DbCommand: Created engine for path '{dataSource}', executing: {CommandText}");
                 
                 // Execute the SQL command
                 var result = engine.Execute(CommandText);
@@ -78,11 +83,28 @@ namespace BasicSQL.EntityFramework.Storage
                     throw new InvalidOperationException($"SQL execution failed: {result.Message}");
                 }
                 
+                Console.WriteLine($"DbCommand: Execution result - Success: {result.Success}, Message: {result.Message}, RowsAffected: {result.RowsAffected}");
+                
+                // Store generated key for INSERT operations that return a row ID
+                if (CommandText.Trim().StartsWith("INSERT", StringComparison.OrdinalIgnoreCase) && 
+                    result.Message.Contains("Row ID:"))
+                {
+                    // Extract the Row ID from the message like "1 row inserted with binary storage (Row ID: 123)"
+                    var match = System.Text.RegularExpressions.Regex.Match(result.Message, @"Row ID:\s*(\d+)");
+                    if (match.Success && int.TryParse(match.Groups[1].Value, out var rowId))
+                    {
+                        // Store the generated key in the connection for EF Core to retrieve
+                        _connection.LastInsertedId = rowId;
+                        Console.WriteLine($"DbCommand: Stored last inserted ID = {rowId}");
+                    }
+                }
+                
                 // Return the number of affected rows
                 return result.RowsAffected;
             }
             catch (Exception ex)
             {
+                Console.WriteLine($"DbCommand: Exception occurred - {ex.Message}");
                 throw new InvalidOperationException($"Failed to execute command: {ex.Message}", ex);
             }
         }
@@ -111,12 +133,117 @@ namespace BasicSQL.EntityFramework.Storage
 
         public override object? ExecuteScalar()
         {
-            throw new NotImplementedException("ExecuteScalar is not yet implemented for BasicSQL Entity Framework provider.");
+            if (string.IsNullOrEmpty(CommandText))
+                return null;
+
+            try
+            {
+                // Extract the database path from the connection string
+                var connectionString = _connection.ConnectionString ?? "";
+                if (string.IsNullOrEmpty(connectionString))
+                {
+                    throw new InvalidOperationException("Connection string is null or empty");
+                }
+                
+                var dataSource = ExtractDataSource(connectionString);
+                if (string.IsNullOrEmpty(dataSource))
+                {
+                    throw new InvalidOperationException($"Could not determine database path from connection string: '{connectionString}'");
+                }
+
+                // Create BasicSQL engine instance
+                var engine = new BinarySqlEngine(dataSource);
+                
+                // Execute the SQL command
+                var result = engine.Execute(CommandText);
+                
+                if (!result.Success)
+                {
+                    throw new InvalidOperationException($"SQL execution failed: {result.Message}");
+                }
+                
+                // For INSERT operations, return the generated ID
+                if (CommandText.Trim().StartsWith("INSERT", StringComparison.OrdinalIgnoreCase) && 
+                    result.Message.Contains("Row ID:"))
+                {
+                    // Extract the Row ID from the message like "1 row inserted with binary storage (Row ID: 123)"
+                    var match = System.Text.RegularExpressions.Regex.Match(result.Message, @"Row ID:\s*(\d+)");
+                    if (match.Success && int.TryParse(match.Groups[1].Value, out var rowId))
+                    {
+                        return rowId;
+                    }
+                }
+                
+                // For SELECT operations, return the first column of the first row
+                if (result.Rows?.Count > 0)
+                {
+                    var firstRow = result.Rows[0];
+                    return firstRow.Values.FirstOrDefault();
+                }
+                
+                return null;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to execute scalar command: {ex.Message}", ex);
+            }
         }
 
         protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
         {
-            throw new NotImplementedException("ExecuteDbDataReader is not yet implemented for BasicSQL Entity Framework provider.");
+            if (string.IsNullOrEmpty(CommandText))
+                return new BasicSqlDataReader(new List<Dictionary<string, object?>>(), new List<string>());
+
+            try
+            {
+                // Extract the database path from the connection string
+                var connectionString = _connection.ConnectionString ?? "";
+                if (string.IsNullOrEmpty(connectionString))
+                {
+                    throw new InvalidOperationException("Connection string is null or empty");
+                }
+                
+                var dataSource = ExtractDataSource(connectionString);
+                if (string.IsNullOrEmpty(dataSource))
+                {
+                    throw new InvalidOperationException($"Could not determine database path from connection string: '{connectionString}'");
+                }
+
+                // Create BasicSQL engine instance
+                var engine = new BinarySqlEngine(dataSource);
+                
+                // Execute the SQL command
+                var result = engine.Execute(CommandText);
+                
+                if (!result.Success)
+                {
+                    throw new InvalidOperationException($"SQL execution failed: {result.Message}");
+                }
+                
+                // For INSERT operations that need to return generated values
+                if (CommandText.Trim().StartsWith("INSERT", StringComparison.OrdinalIgnoreCase) && 
+                    result.Message.Contains("Row ID:"))
+                {
+                    // Extract the Row ID from the message like "1 row inserted with binary storage (Row ID: 123)"
+                    var match = System.Text.RegularExpressions.Regex.Match(result.Message, @"Row ID:\s*(\d+)");
+                    if (match.Success && int.TryParse(match.Groups[1].Value, out var rowId))
+                    {
+                        // Return a synthetic result set with the generated ID
+                        var generatedRow = new Dictionary<string, object?> { { "generated_id", rowId } };
+                        return new BasicSqlDataReader(new List<Dictionary<string, object?>> { generatedRow }, new List<string> { "generated_id" });
+                    }
+                }
+                
+                // For regular SELECT operations
+                var rows = result.Rows ?? new List<Dictionary<string, object?>>();
+                var columns = rows.Count > 0 ? rows[0].Keys.ToList() : new List<string>();
+                
+                return new BasicSqlDataReader(rows, columns);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to execute reader command: {ex.Message}", ex);
+            }
         }
 
         public override void Prepare()

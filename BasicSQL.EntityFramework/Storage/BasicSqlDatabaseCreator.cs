@@ -65,22 +65,36 @@ namespace BasicSQL.EntityFramework.Storage
         public void CreateTables()
         {
             var model = _currentDbContext.Context.Model;
+            Console.WriteLine($"DatabaseCreator: Connection string = '{_connection.ConnectionString}'");
+            
             foreach (var entityType in model.GetEntityTypes())
             {
                 var createTableSql = GenerateCreateTableSql(entityType);
                 if (!string.IsNullOrEmpty(createTableSql))
                 {
+                    Console.WriteLine($"Creating table with SQL: {createTableSql}");
                     var command = _connection.DbConnection.CreateCommand();
                     command.CommandText = createTableSql;
                     _connection.Open();
                     try
                     {
-                        command.ExecuteNonQuery();
+                        var result = command.ExecuteNonQuery();
+                        Console.WriteLine($"Table created successfully: {entityType.GetTableName()}, Result: {result}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error creating table {entityType.GetTableName()}: {ex.Message}");
+                        Console.WriteLine($"Full exception: {ex}");
+                        throw;
                     }
                     finally
                     {
                         _connection.Close();
                     }
+                }
+                else
+                {
+                    Console.WriteLine($"No SQL generated for entity type: {entityType.GetTableName()}");
                 }
             }
         }
@@ -228,8 +242,13 @@ namespace BasicSQL.EntityFramework.Storage
                 
                 sql.Append($"{columnName} {columnType}");
                 
+                var isDatabaseGenerated = property.GetAnnotations()
+                    .Any(x => x.Name == "DatabaseGenerated" && x.Value?.ToString() == "Identity");
+
+                
                 // Check if this is an auto-increment/identity column
-                if (property.ValueGenerated == Microsoft.EntityFrameworkCore.Metadata.ValueGenerated.OnAdd)
+                if (property.ValueGenerated == ValueGenerated.OnAdd ||
+                    isDatabaseGenerated)
                 {
                     if (property.ClrType == typeof(int) || property.ClrType == typeof(long))
                     {

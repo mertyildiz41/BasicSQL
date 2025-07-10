@@ -12,9 +12,7 @@ namespace BasicSQL.Storage
     /// </summary>
     public class HighPerformanceStorageManager
     {
-        private readonly string _dataDirectory;
-        private readonly string _indexDirectory;
-        private readonly string _metaDirectory;
+        private readonly string _baseDirectory;
         private readonly int _rowsPerFile;
         private readonly int _bufferSize;
 
@@ -31,40 +29,49 @@ namespace BasicSQL.Storage
 
         public HighPerformanceStorageManager(string baseDirectory = "fast_data", int rowsPerFile = 50000, int bufferSize = 4 * 1024 * 1024)
         {
-            _dataDirectory = Path.Combine(baseDirectory, "tables");
-            _indexDirectory = Path.Combine(baseDirectory, "indexes");
-            _metaDirectory = Path.Combine(baseDirectory, "metadata");
+            _baseDirectory = baseDirectory;
             _rowsPerFile = rowsPerFile;
             _bufferSize = bufferSize;
-            
-            Directory.CreateDirectory(_dataDirectory);
-            Directory.CreateDirectory(_indexDirectory);
-            Directory.CreateDirectory(_metaDirectory);
+            Directory.CreateDirectory(_baseDirectory);
         }
 
-        /// <summary>
-        /// Gets the binary data file path for a table and file index
-        /// </summary>
-        public string GetTableDataFilePath(string tableName, int fileIndex)
+        // --- Path Helper Methods ---
+        private string GetDatabasePath(string databaseName) => Path.Combine(_baseDirectory, databaseName);
+        private string GetDataDirectory(string databaseName) => Path.Combine(GetDatabasePath(databaseName), "tables");
+        private string GetMetaDirectory(string databaseName) => Path.Combine(GetDatabasePath(databaseName), "metadata");
+        public string GetTableDataFilePath(string databaseName, string tableName, int fileIndex) => Path.Combine(GetDataDirectory(databaseName), $"{tableName}_data_{fileIndex:D6}.bin");
+        public string GetTableMetadataFilePath(string databaseName, string tableName) => Path.Combine(GetMetaDirectory(databaseName), $"{tableName}_meta.json");
+
+        // --- Database Management ---
+        public void CreateDatabase(string databaseName)
         {
-            return Path.Combine(_dataDirectory, $"{tableName}_data_{fileIndex:D6}.bin");
+            var dbPath = GetDatabasePath(databaseName);
+            Directory.CreateDirectory(dbPath);
+            Directory.CreateDirectory(GetDataDirectory(databaseName));
+            Directory.CreateDirectory(GetMetaDirectory(databaseName));
         }
 
-        /// <summary>
-        /// Gets the data directory path for a table
-        /// </summary>
-        public string GetTableDirectory(string tableName)
+        public void DeleteDatabase(string databaseName)
         {
-            return _dataDirectory;
+            var dbPath = GetDatabasePath(databaseName);
+            if (Directory.Exists(dbPath))
+            {
+                Directory.Delete(dbPath, true);
+            }
+        }
+
+        public List<string> GetDatabaseNames()
+        {
+            return Directory.GetDirectories(_baseDirectory).Select(Path.GetFileName).ToList()!;
         }
 
         /// <summary>
         /// Appends a row using ultra-fast binary format
         /// </summary>
-        public int AppendRowBinary(string tableName, Dictionary<string, object?> row, ScalableTableMetadata metadata)
+        public int AppendRowBinary(string databaseName, string tableName, Dictionary<string, object?> row, ScalableTableMetadata metadata)
         {
             var fileIndex = metadata.TotalRows / _rowsPerFile;
-            var filePath = GetTableDataFilePath(tableName, fileIndex);
+            var filePath = GetTableDataFilePath(databaseName, tableName, fileIndex);
             
             try
             {
@@ -88,7 +95,7 @@ namespace BasicSQL.Storage
         /// <summary>
         /// Reads rows using ultra-fast binary format
         /// </summary>
-        public IEnumerable<(int rowId, Dictionary<string, object?> row)> ReadRowsBinary(string tableName, ScalableTableMetadata metadata, int skip = 0, int take = int.MaxValue)
+        public IEnumerable<(int rowId, Dictionary<string, object?> row)> ReadRowsBinary(string databaseName, string tableName, ScalableTableMetadata metadata, int skip = 0, int take = int.MaxValue)
         {
             var rowsRead = 0;
             var startFileIndex = skip / _rowsPerFile;
@@ -96,7 +103,7 @@ namespace BasicSQL.Storage
 
             for (var fileIndex = startFileIndex; fileIndex <= endFileIndex && rowsRead < take; fileIndex++)
             {
-                var filePath = GetTableDataFilePath(tableName, fileIndex);
+                var filePath = GetTableDataFilePath(databaseName, tableName, fileIndex);
                 if (!File.Exists(filePath))
                     continue;
 
@@ -298,9 +305,10 @@ namespace BasicSQL.Storage
         /// <summary>
         /// Gets performance statistics for a table
         /// </summary>
-        public Dictionary<string, object> GetPerformanceStats(string tableName, ScalableTableMetadata metadata)
+        public Dictionary<string, object> GetPerformanceStats(string databaseName, string tableName, ScalableTableMetadata metadata)
         {
-            var binaryFiles = Directory.GetFiles(_dataDirectory, $"{tableName}_data_*.bin");
+            var dataDirectory = GetDataDirectory(databaseName);
+            var binaryFiles = Directory.GetFiles(dataDirectory, $"{tableName}_data_*.bin");
             
             var binarySize = binaryFiles.Sum(f => new FileInfo(f).Length);
 
@@ -320,9 +328,9 @@ namespace BasicSQL.Storage
         /// <summary>
         /// Loads table metadata (same as before)
         /// </summary>
-        public ScalableTableMetadata? LoadTableMetadata(string tableName)
+        public ScalableTableMetadata? LoadTableMetadata(string databaseName, string tableName)
         {
-            var filePath = Path.Combine(_metaDirectory, $"{tableName}_meta.json");
+            var filePath = GetTableMetadataFilePath(databaseName, tableName);
             if (!File.Exists(filePath))
                 return null;
 
@@ -340,9 +348,11 @@ namespace BasicSQL.Storage
         /// <summary>
         /// Saves table metadata (same as before)
         /// </summary>
-        public void SaveTableMetadata(string tableName, ScalableTableMetadata metadata)
+        public void SaveTableMetadata(string databaseName, string tableName, ScalableTableMetadata metadata)
         {
-            var filePath = Path.Combine(_metaDirectory, $"{tableName}_meta.json");
+            var metaDirectory = GetMetaDirectory(databaseName);
+            Directory.CreateDirectory(metaDirectory); // Ensure it exists
+            var filePath = GetTableMetadataFilePath(databaseName, tableName);
             try
             {
                 var json = Newtonsoft.Json.JsonConvert.SerializeObject(metadata, Newtonsoft.Json.Formatting.Indented);
@@ -357,14 +367,15 @@ namespace BasicSQL.Storage
         /// <summary>
         /// Gets all table names from storage
         /// </summary>
-        public List<string> GetTableNames()
+        public List<string> GetTableNames(string databaseName)
         {
             var tableNames = new List<string>();
+            var metaDirectory = GetMetaDirectory(databaseName);
             
-            if (!Directory.Exists(_metaDirectory))
+            if (!Directory.Exists(metaDirectory))
                 return tableNames;
 
-            var metadataFiles = Directory.GetFiles(_metaDirectory, "*_meta.json");
+            var metadataFiles = Directory.GetFiles(metaDirectory, "*_meta.json");
             foreach (var file in metadataFiles)
             {
                 var fileName = Path.GetFileNameWithoutExtension(file);
@@ -381,25 +392,18 @@ namespace BasicSQL.Storage
         /// <summary>
         /// Deletes a table and all its files
         /// </summary>
-        public void DeleteTable(string tableName)
+        public void DeleteTable(string databaseName, string tableName)
         {
             // Delete metadata file
-            var metadataFile = GetTableMetadataFilePath(tableName);
+            var metadataFile = GetTableMetadataFilePath(databaseName, tableName);
             if (File.Exists(metadataFile))
                 File.Delete(metadataFile);
 
             // Delete all data files
-            var dataFiles = Directory.GetFiles(_dataDirectory, $"{tableName}_data_*.bin");
+            var dataDirectory = GetDataDirectory(databaseName);
+            var dataFiles = Directory.GetFiles(dataDirectory, $"{tableName}_data_*.bin");
             foreach (var file in dataFiles)
                 File.Delete(file);
-        }
-
-        /// <summary>
-        /// Gets the metadata file path for a table
-        /// </summary>
-        public string GetTableMetadataFilePath(string tableName)
-        {
-            return Path.Combine(_metaDirectory, $"{tableName}_meta.json");
         }
 
         /// <summary>
@@ -407,7 +411,7 @@ namespace BasicSQL.Storage
         /// Minimizes memory usage and only rewrites files that have changes
         /// Returns the number of rows that were modified or deleted
         /// </summary>
-        public int ProcessRowsBatchBinary(string tableName, ScalableTableMetadata metadata, 
+        public int ProcessRowsBatchBinary(string databaseName, string tableName, ScalableTableMetadata metadata, 
             Func<Dictionary<string, object?>, bool> shouldUpdate, 
             Func<Dictionary<string, object?>, Dictionary<string, object?>>? updateFunction = null)
         {
@@ -424,7 +428,7 @@ namespace BasicSQL.Storage
                 // Process each binary file
                 for (int fileIndex = 0; fileIndex < totalFiles; fileIndex++)
                 {
-                    var sourceFilePath = GetTableDataFilePath(tableName, fileIndex);
+                    var sourceFilePath = GetTableDataFilePath(databaseName, tableName, fileIndex);
                     if (!File.Exists(sourceFilePath)) continue;
 
                     var tempFilePath = Path.Combine(tempDir, $"temp_{fileIndex:D6}.bin");
@@ -507,7 +511,7 @@ namespace BasicSQL.Storage
                 {
                     metadata.TotalRows = newTotalRows;
                     metadata.LastModified = DateTime.UtcNow;
-                    SaveTableMetadata(tableName, metadata);
+                    SaveTableMetadata(databaseName, tableName, metadata);
                 }
                 
                 return modifiedRowCount;

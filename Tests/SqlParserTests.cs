@@ -286,5 +286,80 @@ namespace BasicSQL.Tests
             // Act & Assert
             Assert.Throws<ArgumentException>(() => SqlParser.ParseDelete(invalidSql));
         }
+
+        [Theory]
+        [InlineData("id = 1", "id", 1, true)]
+        [InlineData("id = 1", "id", 2, false)]
+        [InlineData("name = 'test_user'", "name", "test_user", true)]
+        [InlineData("name = 'test_user'", "name", "wrong_user", false)]
+        [InlineData("name != 'test_user'", "name", "test_user", false)]
+        [InlineData("name != 'test_user'", "name", "another_user", true)]
+        [InlineData("value > 10", "value", 20, true)]
+        [InlineData("value > 10", "value", 10, false)]
+        [InlineData("value < 100", "value", 50, true)]
+        [InlineData("value < 100", "value", 100, false)]
+        [InlineData("value >= 20", "value", 20, true)]
+        [InlineData("value >= 20", "value", 19, false)]
+        [InlineData("value <= 50", "value", 50, true)]
+        [InlineData("value <= 50", "value", 51, false)]
+        [InlineData("is_active = NULL", "is_active", null, true)]
+        [InlineData("is_active != NULL", "is_active", null, false)]
+        [InlineData("LEN(name) = 9", "name", "test_user", true)]
+        [InlineData("LEN(name) > 5", "name", "test", false)]
+        public void ParseWhereClause_VariousConditions_ShouldEvaluateCorrectly(string whereClause, string columnName, object columnValue, bool expectedResult)
+        {
+            // Arrange
+            var predicate = SqlParser.ParseWhereClause(whereClause);
+            var row = new Dictionary<string, object?>
+            {
+                { columnName, columnValue }
+            };
+
+            // Act
+            var result = predicate(row);
+
+            // Assert
+            Assert.Equal(expectedResult, result);
+        }
+
+        [Fact]
+        public void TestWhereClauseParsing_WithUnderscoreInValue()
+        {
+            var whereClause = "some_column = 'some_value'";
+            var func = SqlParser.ParseWhereClause(whereClause);
+            var row = new Dictionary<string, object?> { { "some_column", "some_value" } };
+            Assert.True(func(row));
+        }
+
+        [Fact]
+        public void ParseWhereClause_ManualTest_ShouldWork()
+        {
+            // Test simple string comparison
+            var whereClause1 = "name = 'John'";
+            var predicate1 = SqlParser.ParseWhereClause(whereClause1);
+            var row1 = new Dictionary<string, object?> { { "name", "John" } };
+            var row2 = new Dictionary<string, object?> { { "name", "Jane" } };
+            
+            Assert.True(predicate1(row1)); // John should match
+            Assert.False(predicate1(row2)); // Jane should not match
+
+            // Test LEN function
+            var whereClause2 = "LEN(name) = 4";
+            var predicate2 = SqlParser.ParseWhereClause(whereClause2);
+            var row3 = new Dictionary<string, object?> { { "name", "John" } }; // 4 chars
+            var row4 = new Dictionary<string, object?> { { "name", "Alexander" } }; // 9 chars
+            
+            Assert.True(predicate2(row3)); // 'John' (4 chars) should match
+            Assert.False(predicate2(row4)); // 'Alexander' (9 chars) should not match
+
+            // Test numeric comparison
+            var whereClause3 = "age > 25";
+            var predicate3 = SqlParser.ParseWhereClause(whereClause3);
+            var row5 = new Dictionary<string, object?> { { "age", 30 } };
+            var row6 = new Dictionary<string, object?> { { "age", 20 } };
+            
+            Assert.True(predicate3(row5)); // age=30 should match
+            Assert.False(predicate3(row6)); // age=20 should not match
+        }
     }
 }

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using BasicSQL.Models;
 using BasicSQL.Parsers;
 using BasicSQL.Storage;
@@ -16,23 +17,28 @@ namespace BasicSQL.Core
     {
         private readonly Dictionary<string, HighPerformanceTable> _tables;
         private readonly HighPerformanceStorageManager _storageManager;
+        private string _currentDatabase;
+        private const string DefaultDatabase = "default";
         
         public BinarySqlEngine(string dataDirectory = "binary_data")
         {
             _tables = new Dictionary<string, HighPerformanceTable>(StringComparer.OrdinalIgnoreCase);
             _storageManager = new HighPerformanceStorageManager(dataDirectory);
+            _currentDatabase = DefaultDatabase;
+            _storageManager.CreateDatabase(DefaultDatabase); // Ensure default exists
             LoadExistingTables();
         }
 
         /// <summary>
-        /// Loads existing tables from binary storage
+        /// Loads existing tables from binary storage for the current database
         /// </summary>
         private void LoadExistingTables()
         {
-            var tableNames = _storageManager.GetTableNames();
+            _tables.Clear();
+            var tableNames = _storageManager.GetTableNames(_currentDatabase);
             foreach (var tableName in tableNames)
             {
-                var table = HighPerformanceTable.LoadFromStorage(tableName, _storageManager);
+                var table = HighPerformanceTable.LoadFromStorage(tableName, _storageManager, _currentDatabase);
                 if (table != null)
                     _tables[tableName] = table;
             }
@@ -76,6 +82,7 @@ namespace BasicSQL.Core
                     "DELETE" => HandleDelete(tokens),
                     "SHOW" => HandleShow(tokens),
                     "DROP" => HandleDrop(tokens),
+                    "USE" => HandleUseDatabase(tokens),
                     _ => SqlResult.CreateError($"Unknown command: {command}")
                 };
             }
@@ -92,24 +99,74 @@ namespace BasicSQL.Core
         {
             try
             {
-                if (tokens.Count < 2 || tokens[1].ToUpper() != "TABLE")
-                    return SqlResult.CreateError("Invalid CREATE statement. Expected: CREATE TABLE");
+                if (tokens.Count < 2)
+                    return SqlResult.CreateError("Invalid CREATE statement.");
 
-                var sql = string.Join(" ", tokens);
-                var (tableName, columns) = SqlParser.ParseCreateTable(sql);
-                
-                if (_tables.ContainsKey(tableName))
-                    return SqlResult.CreateError($"Table '{tableName}' already exists");
+                var createType = tokens[1].ToUpper();
+                if (createType == "TABLE")
+                {
+                    var sql = string.Join(" ", tokens);
+                    var (tableName, columns, ifNotExists) = SqlParser.ParseCreateTable(sql);
 
-                var table = new HighPerformanceTable(tableName, columns, _storageManager);
-                _tables[tableName] = table;
+                    if (_tables.ContainsKey(tableName))
+                    {
+                        if (ifNotExists)
+                        {
+                            return SqlResult.CreateSuccess($"Table '{tableName}' already exists, statement skipped.");
+                        }
+                        return SqlResult.CreateError($"Table '{tableName}' already exists in database '{_currentDatabase}'");
+                    }
 
-                return SqlResult.CreateSuccess($"Table '{tableName}' created successfully with binary storage");
+                    var table = new HighPerformanceTable(tableName, columns, _storageManager, _currentDatabase);
+                    _tables[tableName] = table;
+
+                    return SqlResult.CreateSuccess($"Table '{tableName}' created successfully in database '{_currentDatabase}'");
+                }
+                if (createType == "DATABASE")
+                {
+                    if (tokens.Count < 3)
+                        return SqlResult.CreateError("Invalid CREATE DATABASE statement. Expected: CREATE DATABASE dbname");
+                    var dbName = tokens[2];
+                    return HandleCreateDatabase(dbName);
+                }
+
+                return SqlResult.CreateError("Invalid CREATE statement. Expected: CREATE TABLE or CREATE DATABASE");
             }
             catch (Exception ex)
             {
-                return SqlResult.CreateError($"CREATE TABLE error: {ex.Message}");
+                return SqlResult.CreateError($"CREATE error: {ex.Message}");
             }
+        }
+
+        private SqlResult HandleCreateDatabase(string dbName)
+        {
+            try
+            {
+                _storageManager.CreateDatabase(dbName);
+                return SqlResult.CreateSuccess($"Database '{dbName}' created successfully.");
+            }
+            catch (Exception ex)
+            {
+                return SqlResult.CreateError($"CREATE DATABASE error: {ex.Message}");
+            }
+        }
+
+        private SqlResult HandleUseDatabase(List<string> tokens)
+        {
+            if (tokens.Count < 2)
+                return SqlResult.CreateError("Invalid USE statement. Expected: USE databasename");
+
+            var dbName = tokens[1];
+            var databases = _storageManager.GetDatabaseNames();
+            if (!databases.Contains(dbName, StringComparer.OrdinalIgnoreCase))
+            {
+                return SqlResult.CreateError($"Database '{dbName}' does not exist.");
+            }
+
+            _currentDatabase = dbName;
+            LoadExistingTables(); // Reload tables from the new database context
+
+            return SqlResult.CreateSuccess($"Switched to database '{dbName}'.");
         }
 
         /// <summary>
@@ -169,7 +226,7 @@ namespace BasicSQL.Core
             {
                 var sql = string.Join(" ", tokens);
                 var query = SqlParser.ParseSelect(sql);
-                if (!_tables.TryGetValue(query.TableName, out var table))
+                if (!_tables.TryGetValue(query.TableName, out var leftTable))
                     return SqlResult.CreateError($"Table '{query.TableName}' does not exist");
 
                 // COUNT with WHERE support: SELECT COUNT FROM users WHERE ...
@@ -178,40 +235,194 @@ namespace BasicSQL.Core
                     Func<Dictionary<string, object?>, bool>? countPredicate = null;
                     if (!string.IsNullOrEmpty(query.WhereClause))
                     {
-                        countPredicate = CreateSimplePredicate(query.WhereClause, table.Columns);
+                        countPredicate = CreateSimplePredicate(query.WhereClause, leftTable.Columns);
                     }
-                    var count = table.SelectRows(predicate: countPredicate).Count();
+                    var count = leftTable.SelectRows(predicate: countPredicate).LongCount(); // Use LongCount to ensure the result is a long
                     var resultRow = new Dictionary<string, object?> { { "COUNT", count } };
                     return SqlResult.CreateQueryResult(new List<string> { "COUNT" }, new List<Dictionary<string, object?>> { resultRow });
+                }
+
+                // Start with the left table's data
+                IEnumerable<Dictionary<string, object?>> intermediateResults = leftTable.SelectRows().ToList();
+
+                // Process joins
+                foreach (var join in query.Joins)
+                {
+                    if (!_tables.TryGetValue(join.ToTableName, out var rightTable))
+                        return SqlResult.CreateError($"Joined table '{join.ToTableName}' does not exist");
+
+                    intermediateResults = PerformJoin(intermediateResults, leftTable, rightTable, join);
                 }
 
                 // Simple predicate creation - for now just basic equality conditions
                 Func<Dictionary<string, object?>, bool>? predicate = null;
                 if (!string.IsNullOrEmpty(query.WhereClause))
                 {
-                    predicate = CreateSimplePredicate(query.WhereClause, table.Columns);
+                    var allColumns = new List<Column>(leftTable.Columns);
+                    foreach (var join in query.Joins)
+                    {
+                        if (_tables.TryGetValue(join.ToTableName, out var rightTable))
+                        {
+                            allColumns.AddRange(rightTable.Columns);
+                        }
+                    }
+                    predicate = SqlParser.ParseWhereClause(query.WhereClause);
+                }
+
+                var resultsWithWhere = (predicate != null ? intermediateResults.Where(predicate) : intermediateResults).ToList();
+
+                var requestedColumns = query.Columns;
+                var columnsToSelect = new List<string>();
+                var hasLenFunction = false;
+
+                if (!requestedColumns.Contains("*"))
+                {
+                    foreach (var col in requestedColumns)
+                    {
+                        var lenMatch = Regex.Match(col, @"LEN\s*\(\s*(\w+)\s*\)", RegexOptions.IgnoreCase);
+                        if (lenMatch.Success)
+                        {
+                            columnsToSelect.Add(lenMatch.Groups[1].Value);
+                            hasLenFunction = true;
+                        }
+                        else
+                        {
+                            columnsToSelect.Add(col);
+                        }
+                    }
+                }
+                else
+                {
+                    columnsToSelect = null; // Select all
                 }
 
                 // Execute the query with binary storage streaming
-                var results = table.SelectRows(
-                    columnNames: query.Columns.Contains("*") ? null : query.Columns,
-                    predicate: predicate,
-                    orderByColumn: query.OrderByColumn,
-                    orderDescending: query.OrderDescending,
-                    limit: query.Limit
-                ).ToList();
+                var results = resultsWithWhere;
 
-                var columnNames = query.Columns.Contains("*") 
-                    ? table.Columns.Select(c => c.Name).ToList()
-                    : query.Columns;
+                if (hasLenFunction && !requestedColumns.Contains("*"))
+                {
+                    var processedResults = new List<Dictionary<string, object?>>();
+                    foreach (var row in results)
+                    {
+                        var newRow = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var requestedCol in requestedColumns)
+                        {
+                            var lenMatch = Regex.Match(requestedCol, @"LEN\s*\(\s*(\w+)\s*\)", RegexOptions.IgnoreCase);
+                            if (lenMatch.Success)
+                            {
+                                var actualColumnName = lenMatch.Groups[1].Value;
+                                if (row.TryGetValue(actualColumnName, out var colValue) && colValue != null)
+                                {
+                                    newRow[requestedCol] = colValue.ToString()?.Length ?? 0;
+                                }
+                                else
+                                {
+                                    newRow[requestedCol] = 0;
+                                }
+                            }
+                            else
+                            {
+                                newRow[requestedCol] = row[requestedCol];
+                            }
+                        }
+                        processedResults.Add(newRow);
+                    }
+                    results = processedResults;
+                }
 
-                return SqlResult.CreateQueryResult(columnNames, results);
+                var finalColumns = query.Columns;
+                if (finalColumns.Contains("*"))
+                {
+                    if (query.Joins.Any())
+                    {
+                        // With joins, use fully qualified names
+                        finalColumns = new List<string>(leftTable.Columns.Select(c => $"{leftTable.Name}.{c.Name}"));
+                        foreach (var join in query.Joins)
+                        {
+                            if (_tables.TryGetValue(join.ToTableName, out var rightTable))
+                            {
+                                finalColumns.AddRange(rightTable.Columns.Select(c => $"{rightTable.Name}.{c.Name}"));
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // No joins, use simple column names
+                        finalColumns = new List<string>(leftTable.Columns.Select(c => c.Name));
+                    }
+                }
+
+                return SqlResult.CreateQueryResult(finalColumns, results);
             }
             catch (Exception ex)
             {
                 return SqlResult.CreateError($"SELECT error: {ex.Message}");
             }
         }
+
+        private IEnumerable<Dictionary<string, object?>> PerformJoin(IEnumerable<Dictionary<string, object?>> leftRows, HighPerformanceTable leftTable, HighPerformanceTable rightTable, JoinClause join)
+        {
+            var rightRows = rightTable.SelectRows().ToList();
+            var (leftJoinColumn, rightJoinColumn) = ParseJoinCondition(join.ParsedOnClause, leftTable, rightTable);
+
+            var joinedResults = new List<Dictionary<string, object?>>();
+
+            foreach (var leftRow in leftRows)
+            {
+                bool matchFound = false;
+                foreach (var rightRow in rightRows)
+                {
+                    if (Equals(leftRow[leftJoinColumn], rightRow[rightJoinColumn]))
+                    {
+                        var combinedRow = CombineRows(leftRow, leftTable.Name, rightRow, rightTable.Name);
+                        joinedResults.Add(combinedRow);
+                        matchFound = true;
+                    }
+                }
+
+                if (!matchFound && join.JoinType == JoinType.Left)
+                {
+                    var combinedRow = CombineRows(leftRow, leftTable.Name, null, rightTable.Name, rightTable.Columns);
+                    joinedResults.Add(combinedRow);
+                }
+            }
+            return joinedResults;
+        }
+
+        private (string left, string right) ParseJoinCondition((string left, string right) onClause, HighPerformanceTable leftTable, HighPerformanceTable rightTable)
+        {
+            var leftCol = onClause.left.Split('.')[1];
+            var rightCol = onClause.right.Split('.')[1];
+            return (leftCol, rightCol);
+        }
+
+        private Dictionary<string, object?> CombineRows(Dictionary<string, object?> leftRow, string leftTableName, Dictionary<string, object?>? rightRow, string rightTableName, List<Column>? rightTableColumns = null)
+        {
+            var combined = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var col in leftRow)
+            {
+                combined[$"{leftTableName}.{col.Key}"] = col.Value;
+            }
+
+            if (rightRow != null)
+            {
+                foreach (var col in rightRow)
+                {
+                    combined[$"{rightTableName}.{col.Key}"] = col.Value;
+                }
+            }
+            else if (rightTableColumns != null)
+            {
+                foreach (var col in rightTableColumns)
+                {
+                    combined[$"{rightTableName}.{col.Name}"] = null;
+                }
+            }
+
+            return combined;
+        }
+
 
         /// <summary>
         /// Handles UPDATE statements
@@ -286,6 +497,7 @@ namespace BasicSQL.Core
                 return showType switch
                 {
                     "TABLES" => SqlResult.CreateTableListResult(_tables.Keys.ToList()),
+                    "DATABASES" => SqlResult.CreateDatabaseListResult(_storageManager.GetDatabaseNames()),
                     _ => SqlResult.CreateError($"Unknown SHOW command: {showType}")
                 };
             }
@@ -302,22 +514,38 @@ namespace BasicSQL.Core
         {
             try
             {
-                if (tokens.Count < 3 || tokens[1].ToUpper() != "TABLE")
-                    return SqlResult.CreateError("Invalid DROP statement. Expected: DROP TABLE tablename");
+                if (tokens.Count < 3)
+                    return SqlResult.CreateError("Invalid DROP statement.");
 
-                var tableName = tokens[2];
-                
-                if (!_tables.ContainsKey(tableName))
-                    return SqlResult.CreateError($"Table '{tableName}' does not exist");
+                var dropType = tokens[1].ToUpper();
+                var objectName = tokens[2];
 
-                _tables.Remove(tableName);
-                _storageManager.DeleteTable(tableName);
+                if (dropType == "TABLE")
+                {
+                    if (!_tables.ContainsKey(objectName))
+                        return SqlResult.CreateError($"Table '{objectName}' does not exist in database '{_currentDatabase}'");
+
+                    _tables.Remove(objectName);
+                    _storageManager.DeleteTable(_currentDatabase, objectName);
+
+                    return SqlResult.CreateSuccess($"Table '{objectName}' dropped successfully from database '{_currentDatabase}'");
+                }
+                if (dropType == "DATABASE")
+                {
+                     _storageManager.DeleteDatabase(objectName);
+                     if (string.Equals(_currentDatabase, objectName, StringComparison.OrdinalIgnoreCase))
+                     {
+                         _currentDatabase = DefaultDatabase;
+                         LoadExistingTables();
+                     }
+                     return SqlResult.CreateSuccess($"Database '{objectName}' dropped successfully.");
+                }
                 
-                return SqlResult.CreateSuccess($"Table '{tableName}' dropped successfully");
+                return SqlResult.CreateError("Invalid DROP statement. Expected: DROP TABLE <name> or DROP DATABASE <name>");
             }
             catch (Exception ex)
             {
-                return SqlResult.CreateError($"DROP TABLE error: {ex.Message}");
+                return SqlResult.CreateError($"DROP error: {ex.Message}");
             }
         }
 
@@ -326,74 +554,7 @@ namespace BasicSQL.Core
         /// </summary>
         private Func<Dictionary<string, object?>, bool> CreateSimplePredicate(string whereClause, List<Column> columns)
         {
-            return row =>
-            {
-                // Parse comparison operators: =, <=, >=, <, >, !=
-                string[] operators = { "<=", ">=", "!=", "=", "<", ">" };
-                string? foundOperator = null;
-                string[]? parts = null;
-                
-                foreach (var op in operators)
-                {
-                    var splitParts = whereClause.Split(new[] { op }, StringSplitOptions.None);
-                    if (splitParts.Length == 2)
-                    {
-                        foundOperator = op;
-                        parts = splitParts;
-                        break;
-                    }
-                }
-                
-                if (foundOperator != null && parts != null)
-                {
-                    var columnName = parts[0].Trim();
-                    var expectedValueStr = parts[1].Trim();
-                    
-                    // Remove quotes from string values
-                    if (expectedValueStr.StartsWith("'") && expectedValueStr.EndsWith("'"))
-                    {
-                        expectedValueStr = expectedValueStr.Substring(1, expectedValueStr.Length - 2);
-                    }
-                    
-                    if (row.TryGetValue(columnName, out var actualValue))
-                    {
-                        // Handle different data types
-                        if (actualValue == null)
-                            return expectedValueStr.Equals("NULL", StringComparison.OrdinalIgnoreCase);
-                        
-                        // Try numeric comparison first
-                        if (int.TryParse(expectedValueStr, out var expectedInt) && actualValue is int actualInt)
-                        {
-                            return foundOperator switch
-                            {
-                                "=" => actualInt == expectedInt,
-                                "!=" => actualInt != expectedInt,
-                                "<" => actualInt < expectedInt,
-                                "<=" => actualInt <= expectedInt,
-                                ">" => actualInt > expectedInt,
-                                ">=" => actualInt >= expectedInt,
-                                _ => false
-                            };
-                        }
-                        
-                        // Fall back to string comparison
-                        var actualStr = actualValue.ToString();
-                        return foundOperator switch
-                        {
-                            "=" => actualStr == expectedValueStr,
-                            "!=" => actualStr != expectedValueStr,
-                            "<" => string.Compare(actualStr, expectedValueStr, StringComparison.Ordinal) < 0,
-                            "<=" => string.Compare(actualStr, expectedValueStr, StringComparison.Ordinal) <= 0,
-                            ">" => string.Compare(actualStr, expectedValueStr, StringComparison.Ordinal) > 0,
-                            ">=" => string.Compare(actualStr, expectedValueStr, StringComparison.Ordinal) >= 0,
-                            _ => false
-                        };
-                    }
-                }
-                
-                // If we can't parse the WHERE clause, return false (no matches)
-                return false;
-            };
+            return SqlParser.ParseWhereClause(whereClause);
         }
 
         /// <summary>
@@ -439,7 +600,7 @@ namespace BasicSQL.Core
         {
             foreach (var tableName in _tables.Keys.ToList())
             {
-                _storageManager.DeleteTable(tableName);
+                _storageManager.DeleteTable(_currentDatabase, tableName);
             }
             _tables.Clear();
         }

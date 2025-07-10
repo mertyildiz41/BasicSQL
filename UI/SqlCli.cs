@@ -74,6 +74,7 @@ namespace BasicSQL.UI
             Console.WriteLine("  .stats    - Show database statistics");
             Console.WriteLine("  .clear    - Clear all tables");
             Console.WriteLine("  .quit     - Exit the program");
+            Console.WriteLine("To create a user, run the application with the following arguments: --create-user <username> <password>");
             Console.WriteLine(new string('=', 60));
             Console.WriteLine();
         }

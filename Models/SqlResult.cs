@@ -15,6 +15,7 @@ namespace BasicSQL.Models
         public List<Dictionary<string, object?>> Rows { get; set; } = new List<Dictionary<string, object?>>();
         public int RowsAffected { get; set; }
         public List<string> Tables { get; set; } = new List<string>();
+        public List<string> Databases { get; set; } = new List<string>();
 
         public static SqlResult CreateSuccess(string message, int rowsAffected = 0)
         {
@@ -57,8 +58,19 @@ namespace BasicSQL.Models
             };
         }
 
+        public static SqlResult CreateDatabaseListResult(List<string> databases)
+        {
+            return new SqlResult
+            {
+                Success = true,
+                Databases = databases,
+                Message = $"{databases.Count} database(s) found"
+            };
+        }
+
         public bool IsQueryResult => Columns.Count > 0 || Rows.Count > 0;
         public bool IsTableListResult => Tables.Count > 0;
+        public bool IsDatabaseListResult => Databases.Count > 0;
 
         public override string ToString()
         {
@@ -70,6 +82,9 @@ namespace BasicSQL.Models
             
             if (IsTableListResult)
                 return $"Found {Tables.Count} table(s)";
+
+            if (IsDatabaseListResult)
+                return $"Found {Databases.Count} database(s)";
             
             return Message;
         }

@@ -21,7 +21,7 @@ namespace BasicSQL.EntityFramework.Storage
             set => throw new NotSupportedException("Cannot change connection string after initialization.");
         }
         
-        public DbConnection DbConnection 
+        public virtual DbConnection DbConnection 
         { 
             get => _connection ??= new BasicSqlDbConnection(ConnectionString);
             set => throw new NotSupportedException("Cannot change DbConnection on BasicSqlRelationalConnection.");

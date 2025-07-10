@@ -2,6 +2,8 @@ using BasicSQL.EntityFramework.Extensions;
 using FluentAssertions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -18,6 +20,7 @@ namespace BasicSQL.EntityFramework.Tests.Integration
             _output = output;
             _testDbPath = Path.Combine(Path.GetTempPath(), $"test_db_{Guid.NewGuid():N}");
             Directory.CreateDirectory(_testDbPath);
+            Console.WriteLine($"Using test database at: {_testDbPath}");
 
             var options = new DbContextOptionsBuilder<TestDbContext>()
                 .UseBasicSql($"Data Source={_testDbPath}")
@@ -72,14 +75,14 @@ namespace BasicSQL.EntityFramework.Tests.Integration
         }
 
         [Fact]
-        public async Task Add_ShouldWorkWithBasicTypes()
+        public async Task Add_ShouldWorkWithAutoIncrement()
         {
             // Arrange
             await _context.Database.EnsureCreatedAsync();
             
             var entity = new TestEntity
             {
-                Id = 1, // Manually set ID
+                // Don't set Id - let auto-increment handle it
                 Name = "Test Entity",
                 CreatedAt = DateTime.Now,
                 Amount = 123.45m
@@ -87,11 +90,12 @@ namespace BasicSQL.EntityFramework.Tests.Integration
 
             // Act
             _context.TestEntities.Add(entity);
+            
             var saveResult = await _context.SaveChangesAsync();
 
             // Assert
             saveResult.Should().Be(1, "One entity should be saved");
-            entity.Id.Should().Be(1, "Entity should have the assigned ID");
+            entity.Id.Should().BeGreaterThan(0, "Entity should have an auto-generated ID");
 
             // Verify the entity was actually saved
             var savedEntity = await _context.TestEntities.FindAsync(entity.Id);
@@ -245,22 +249,12 @@ namespace BasicSQL.EntityFramework.Tests.Integration
         }
 
         public DbSet<TestEntity> TestEntities { get; set; } = null!;
-
-        protected override void OnModelCreating(ModelBuilder modelBuilder)
-        {
-            modelBuilder.Entity<TestEntity>(entity =>
-            {
-                entity.HasKey(e => e.Id);
-                entity.Property(e => e.Id).ValueGeneratedNever(); // Don't use EF Core value generation
-                entity.Property(e => e.Name).IsRequired().HasMaxLength(255);
-                entity.Property(e => e.CreatedAt).IsRequired();
-                entity.Property(e => e.Amount).HasPrecision(18, 2);
-            });
-        }
     }
 
     public class TestEntity
     {
+        [Key]
+        [DatabaseGenerated(DatabaseGeneratedOption.Identity)]
         public int Id { get; set; }
         public string Name { get; set; } = string.Empty;
         public DateTime CreatedAt { get; set; }

@@ -5,40 +5,269 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>BasicSQL Web IDE</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/theme/material-darker.min.css">
     <style>
-        body { background: #f8f9fa; }
-        .editor { font-family: monospace; min-height: 200px; }
-        .results-area { white-space: pre; background: #222; color: #eee; padding: 1em; border-radius: 6px; min-height: 120px; }
+        body, html { height: 100%; margin: 0; font-family: sans-serif; }
+        .main-layout { display: flex; height: 100%; }
+        .sidebar { width: 250px; background: #f8f9fa; border-right: 1px solid #dee2e6; padding: 1em; overflow-y: auto; }
+        .content-area { flex-grow: 1; display: flex; flex-direction: column; }
+        .editor-container { flex-grow: 1; position: relative; }
+        .results-container { height: 30%; background: #343a40; color: #f8f9fa; padding: 1em; overflow-y: auto; white-space: pre-wrap; font-family: monospace; }
+        .CodeMirror { border: 1px solid #dee2e6; height: 100%; }
+        #login-modal .modal-dialog { max-width: 400px; }
+        .nav-link { cursor: pointer; }
     </style>
 </head>
 <body>
-<div class="container py-4">
-    <h2 class="mb-4">BasicSQL Web IDE</h2>
-    <form id="sql-form">
-        <div class="mb-3">
-            <label for="sql" class="form-label">SQL Query</label>
-            <textarea class="form-control editor" id="sql" rows="6" placeholder="Type your SQL here..."></textarea>
+
+<!-- Main Layout -->
+<div class="main-layout" style="display: none;">
+    <div class="sidebar">
+        <h5>Database: <span id="current-database">default</span></h5>
+        <hr>
+        <h6>Tables</h6>
+        <ul class="nav flex-column" id="tables-list">
+            <!-- Table list will be populated here -->
+        </ul>
+        <hr>
+        <button class="btn btn-outline-primary btn-sm" id="change-database-btn">Change Database</button>
+    </div>
+    <div class="content-area">
+        <div class="editor-container">
+            <textarea id="sql-editor"></textarea>
         </div>
-        <button type="submit" class="btn btn-primary">Run</button>
-    </form>
-    <div class="mt-4">
-        <h5>Results</h5>
-        <div id="results" class="results-area"></div>
+        <div class="results-container" id="results-area">
+            Welcome to BasicSQL Web IDE. Authenticate to begin.
+        </div>
     </div>
 </div>
+
+<!-- Database Selection Modal -->
+<div class="modal fade" id="database-modal" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1" aria-labelledby="databaseModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="databaseModalLabel">Select Database</h5>
+            </div>
+            <div class="modal-body">
+                <p>Please select a database to work with:</p>
+                <div class="list-group" id="database-list">
+                    <!-- Database list will be populated here -->
+                </div>
+                <div class="alert alert-info mt-3">
+                    <strong>Note:</strong> You can also use the default database by clicking "Use Default" below.
+                </div>
+                <div class="alert alert-danger" id="database-error" style="display: none;"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" id="use-default-btn">Use Default Database</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Login Modal -->
+<div class="modal fade" id="login-modal" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1" aria-labelledby="loginModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="loginModalLabel">Authentication Required</h5>
+            </div>
+            <div class="modal-body">
+                <form id="login-form">
+                    <div class="mb-3">
+                        <label for="username" class="form-label">Username</label>
+                        <input type="text" class="form-control" id="username" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="password" class="form-label">Password</label>
+                        <input type="password" class="form-control" id="password" required>
+                    </div>
+                    <div class="alert alert-danger" id="login-error" style="display: none;"></div>
+                    <button type="submit" class="btn btn-primary">Login</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/mode/sql/sql.min.js"></script>
 <script>
-    document.getElementById('sql-form').addEventListener('submit', async function(e) {
+    const loginModal = new bootstrap.Modal(document.getElementById('login-modal'));
+    const databaseModal = new bootstrap.Modal(document.getElementById('database-modal'));
+    const mainLayout = document.querySelector('.main-layout');
+    const loginForm = document.getElementById('login-form');
+    const loginError = document.getElementById('login-error');
+    const databaseError = document.getElementById('database-error');
+    const tablesList = document.getElementById('tables-list');
+    const resultsArea = document.getElementById('results-area');
+    const databaseList = document.getElementById('database-list');
+    const currentDatabaseSpan = document.getElementById('current-database');
+    const changeDatabaseBtn = document.getElementById('change-database-btn');
+    const useDefaultBtn = document.getElementById('use-default-btn');
+    let credentials = {};
+    let currentDatabase = 'default';
+
+    const editor = CodeMirror.fromTextArea(document.getElementById('sql-editor'), {
+        mode: 'text/x-sql',
+        theme: 'material-darker',
+        lineNumbers: true,
+        autofocus: true,
+        extraKeys: { "Ctrl-Enter": runQuery }
+    });
+
+    window.addEventListener('load', () => {
+        loginModal.show();
+    });
+
+    loginForm.addEventListener('submit', async (e) => {
         e.preventDefault();
-        const sql = document.getElementById('sql').value;
-        document.getElementById('results').textContent = 'Running...';
+        const username = document.getElementById('username').value;
+        const password = document.getElementById('password').value;
+        
+        credentials = { username, password };
+
+        // Check for available databases first
+        try {
+            const databaseRes = await fetch('/api/databases', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(credentials)
+            });
+
+            if (databaseRes.ok) {
+                const databases = await databaseRes.json();
+                
+                if (databases && databases.length > 0) {
+                    // Show database selection modal
+                    populateDatabases(databases);
+                    loginError.style.display = 'none';
+                    loginModal.hide();
+                    databaseModal.show();
+                } else {
+                    // No custom databases, proceed with default
+                    await loginWithDatabase('default');
+                }
+            } else {
+                const errorText = await databaseRes.text();
+                loginError.textContent = errorText || 'Authentication failed.';
+                loginError.style.display = 'block';
+            }
+        } catch (error) {
+            loginError.textContent = 'Failed to connect to server.';
+            loginError.style.display = 'block';
+        }
+    });
+
+    async function loginWithDatabase(database) {
+        currentDatabase = database;
+        
+        // Switch to the selected database if not default
+        if (database !== 'default') {
+            const useDbRes = await fetch('/api/use-database', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ...credentials, database })
+            });
+
+            if (!useDbRes.ok) {
+                const errorText = await useDbRes.text();
+                databaseError.textContent = errorText || 'Failed to switch database.';
+                databaseError.style.display = 'block';
+                return;
+            }
+        }
+
+        // Get tables for the selected database
+        const tablesRes = await fetch('/api/tables', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(credentials)
+        });
+
+        if (tablesRes.ok) {
+            currentDatabaseSpan.textContent = currentDatabase;
+            databaseModal.hide();
+            mainLayout.style.display = 'flex';
+            const tables = await tablesRes.json();
+            populateTables(tables);
+        } else {
+            const errorText = await tablesRes.text();
+            databaseError.textContent = errorText || 'Failed to get tables.';
+            databaseError.style.display = 'block';
+        }
+    }
+
+    function populateDatabases(databases) {
+        databaseList.innerHTML = '';
+        databases.forEach(db => {
+            const item = document.createElement('button');
+            item.className = 'list-group-item list-group-item-action';
+            item.textContent = db;
+            item.onclick = () => loginWithDatabase(db);
+            databaseList.appendChild(item);
+        });
+    }
+
+    useDefaultBtn.addEventListener('click', () => {
+        loginWithDatabase('default');
+    });
+
+    changeDatabaseBtn.addEventListener('click', async () => {
+        try {
+            const databaseRes = await fetch('/api/databases', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(credentials)
+            });
+
+            if (databaseRes.ok) {
+                const databases = await databaseRes.json();
+                populateDatabases(databases);
+                databaseModal.show();
+            }
+        } catch (error) {
+            console.error('Failed to get databases:', error);
+        }
+    });
+
+    function populateTables(tables) {
+        tablesList.innerHTML = '';
+        if (tables && tables.length > 0) {
+            tables.forEach(table => {
+                const li = document.createElement('li');
+                li.className = 'nav-item';
+                const a = document.createElement('a');
+                a.className = 'nav-link';
+                a.textContent = table;
+                a.onclick = () => {
+                    editor.setValue(`SELECT * FROM ${table} LIMIT 100;`);
+                    runQuery();
+                };
+                li.appendChild(a);
+                tablesList.appendChild(li);
+            });
+        } else {
+            tablesList.innerHTML = '<li class="nav-item"><span class="nav-link text-muted">No tables found.</span></li>';
+        }
+    }
+
+    async function runQuery() {
+        const sql = editor.getValue();
+        if (!sql.trim()) return;
+
+        resultsArea.textContent = 'Running...';
         const res = await fetch('/api/query', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sql })
+            body: JSON.stringify({ ...credentials, sql })
         });
         const text = await res.text();
-        document.getElementById('results').textContent = text;
-    });
+        resultsArea.textContent = text;
+    }
 </script>
 </body>
 </html>

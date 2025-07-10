@@ -13,6 +13,7 @@ namespace BasicSQL.Models
     public class HighPerformanceTable
     {
         private readonly HighPerformanceStorageManager _storageManager;
+        private readonly string _databaseName;
         private ScalableTableMetadata _metadata;
 
         public string Name => _metadata.TableName;
@@ -21,9 +22,10 @@ namespace BasicSQL.Models
         public bool HasPrimaryKey => _metadata.HasPrimaryKey;
         public long EstimatedSizeBytes => _metadata.EstimatedSizeBytes;
 
-        public HighPerformanceTable(string tableName, List<Column> columns, HighPerformanceStorageManager storageManager)
+        public HighPerformanceTable(string tableName, List<Column> columns, HighPerformanceStorageManager storageManager, string databaseName)
         {
             _storageManager = storageManager;
+            _databaseName = databaseName;
             
             // Initialize metadata
             _metadata = new ScalableTableMetadata
@@ -50,23 +52,24 @@ namespace BasicSQL.Models
         /// <summary>
         /// Loads an existing table from storage
         /// </summary>
-        public static HighPerformanceTable? LoadFromStorage(string tableName, HighPerformanceStorageManager storageManager)
+        public static HighPerformanceTable? LoadFromStorage(string tableName, HighPerformanceStorageManager storageManager, string databaseName)
         {
-            var metadata = storageManager.LoadTableMetadata(tableName);
+            var metadata = storageManager.LoadTableMetadata(databaseName, tableName);
             if (metadata == null)
                 return null;
 
-            var table = new HighPerformanceTable(storageManager, metadata);
+            var table = new HighPerformanceTable(storageManager, metadata, databaseName);
             return table;
         }
 
         /// <summary>
         /// Private constructor for loading from storage
         /// </summary>
-        private HighPerformanceTable(HighPerformanceStorageManager storageManager, ScalableTableMetadata metadata)
+        private HighPerformanceTable(HighPerformanceStorageManager storageManager, ScalableTableMetadata metadata, string databaseName)
         {
             _storageManager = storageManager;
             _metadata = metadata;
+            _databaseName = databaseName;
 
             // Ensure AutoIncrementValues is initialized if missing
             if (_metadata.AutoIncrementValues == null)
@@ -167,7 +170,7 @@ namespace BasicSQL.Models
             }
 
             // Use high-performance storage
-            int actualRowId = _storageManager.AppendRowBinary(_metadata.TableName, validatedRow, _metadata);
+            int actualRowId = _storageManager.AppendRowBinary(_databaseName, _metadata.TableName, validatedRow, _metadata);
 
             // Update metadata every 1000 rows for better performance
             if (_metadata.TotalRows % 1000 == 0)
@@ -194,7 +197,7 @@ namespace BasicSQL.Models
 
             // Stream rows from high-performance storage
             IEnumerable<(int rowId, Dictionary<string, object?>)> rowStream;
-            rowStream = _storageManager.ReadRowsBinary(_metadata.TableName, _metadata, skip, actualLimit);
+            rowStream = _storageManager.ReadRowsBinary(_databaseName, _metadata.TableName, _metadata, skip, actualLimit);
 
             foreach (var (rowId, row) in rowStream)
             {
@@ -218,7 +221,7 @@ namespace BasicSQL.Models
         /// </summary>
         public Dictionary<string, object> GetPerformanceStats()
         {
-            var baseStats = _storageManager.GetPerformanceStats(_metadata.TableName, _metadata);
+            var baseStats = _storageManager.GetPerformanceStats(_databaseName, _metadata.TableName, _metadata);
             
             baseStats["StorageFormat"] = "Binary";
             baseStats["HasPrimaryKey"] = _metadata.HasPrimaryKey;
@@ -276,6 +279,7 @@ namespace BasicSQL.Models
             Console.WriteLine("=" + new string('=', 70));
 
             var binaryStorage = new HighPerformanceStorageManager("perf_test_binary", 10000, 4 * 1024 * 1024);
+            binaryStorage.CreateDatabase("default");
 
             var columns = new List<Column>
             {
@@ -285,7 +289,7 @@ namespace BasicSQL.Models
             };
 
             Console.WriteLine("\n📊 Testing Binary Format:");
-            var binaryTable = new HighPerformanceTable("perf_binary", columns, binaryStorage);
+            var binaryTable = new HighPerformanceTable("perf_binary", columns, binaryStorage, "default");
             var binaryInsertTime = TestInsertPerformance(binaryTable, recordCount);
             var binarySelectTime = TestSelectPerformance(binaryTable, recordCount / 10);
             var binaryStats = binaryTable.GetPerformanceStats();
@@ -364,6 +368,7 @@ namespace BasicSQL.Models
         {
             // Use the storage manager's new binary batch processing method
             return _storageManager.ProcessRowsBatchBinary(
+                _databaseName,
                 _metadata.TableName,
                 _metadata,
                 row => predicate == null || predicate(row),
@@ -449,7 +454,7 @@ namespace BasicSQL.Models
                 if (predicate == null)
                 {
                     var totalRows = _metadata.TotalRows;
-                    _storageManager.DeleteTable(_metadata.TableName);
+                    _storageManager.DeleteTable(_databaseName, _metadata.TableName);
                     ResetTableMetadata();
                     return totalRows;
                 }
@@ -472,6 +477,7 @@ namespace BasicSQL.Models
         {
             // Use the storage manager's new binary batch processing method for deletions
             return _storageManager.ProcessRowsBatchBinary(
+                _databaseName,
                 _metadata.TableName,
                 _metadata,
                 row => predicate(row),  // Identify rows to delete
@@ -497,7 +503,7 @@ namespace BasicSQL.Models
                 NextRowId = 0,
                 AutoIncrementValues = originalAutoIncrement
             };
-            _storageManager.SaveTableMetadata(_metadata.TableName, _metadata);
+            _storageManager.SaveTableMetadata(_databaseName, _metadata.TableName, _metadata);
         }
 
         /// <summary>
@@ -507,7 +513,7 @@ namespace BasicSQL.Models
         private void RewriteTableData(List<Dictionary<string, object?>> rows)
         {
             // Clear existing data
-            _storageManager.DeleteTable(_metadata.TableName);
+            _storageManager.DeleteTable(_databaseName, _metadata.TableName);
             
             // Reset metadata for rewriting
             var originalAutoIncrement = new Dictionary<string, long>(_metadata.AutoIncrementValues);
@@ -558,7 +564,7 @@ namespace BasicSQL.Models
             }
             
             // Save metadata
-            _storageManager.SaveTableMetadata(_metadata.TableName, _metadata);
+            _storageManager.SaveTableMetadata(_databaseName, _metadata.TableName, _metadata);
         }
 
         /// <summary>
@@ -600,7 +606,7 @@ namespace BasicSQL.Models
                 }
             }
 
-            _storageManager.AppendRowBinary(_metadata.TableName, validatedRow, _metadata);
+            _storageManager.AppendRowBinary(_databaseName, _metadata.TableName, validatedRow, _metadata);
 
             _metadata.TotalRows++;
             _metadata.LastModified = DateTime.UtcNow;
@@ -622,7 +628,7 @@ namespace BasicSQL.Models
 
         private void SaveMetadata()
         {
-            _storageManager.SaveTableMetadata(_metadata.TableName, _metadata);
+            _storageManager.SaveTableMetadata(_databaseName, _metadata.TableName, _metadata);
         }
     }
 }

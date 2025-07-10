@@ -1,4 +1,6 @@
 using Microsoft.EntityFrameworkCore.Storage;
+using System.Collections;
+using System.Data;
 using System.Data.Common;
 using System.Net.Sockets;
 using System.Text;
@@ -7,21 +9,24 @@ using System.Threading.Tasks;
 
 namespace BasicSQL.EntityFramework.Storage
 {
-    public class BasicSqlSocketRelationalConnection : RelationalConnection
+    public class BasicSqlSocketRelationalConnection : BasicSqlRelationalConnection
     {
+        private BasicSqlSocketDbConnection? _socketConnection;
+        
         public BasicSqlSocketRelationalConnection(RelationalConnectionDependencies dependencies)
             : base(dependencies) { }
 
-        protected override DbConnection CreateDbConnection()
-        {
-            return new BasicSqlSocketDbConnection(ConnectionString);
+        public override DbConnection DbConnection 
+        { 
+            get => _socketConnection ??= new BasicSqlSocketDbConnection(ConnectionString);
+            set => throw new NotSupportedException("Cannot change DbConnection on BasicSqlSocketRelationalConnection.");
         }
     }
 
     public class BasicSqlSocketDbConnection : DbConnection
     {
         private string _connectionString;
-        public BasicSqlSocketDbConnection(string connectionString) => _connectionString = connectionString;
+        public BasicSqlSocketDbConnection(string? connectionString) => _connectionString = connectionString ?? string.Empty;
         public override string ConnectionString { get => _connectionString; set => _connectionString = value; }
         public override string Database => "BasicSQL";
         public override string DataSource => "localhost";
@@ -31,12 +36,18 @@ namespace BasicSQL.EntityFramework.Storage
         public override void Close() { }
         public override void Open() { }
         protected override DbCommand CreateDbCommand() => new BasicSqlSocketDbCommand(this);
+        protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) => throw new NotSupportedException("Transactions not supported");
     }
 
     public class BasicSqlSocketDbCommand : DbCommand
     {
         private readonly BasicSqlSocketDbConnection _connection;
-        public BasicSqlSocketDbCommand(BasicSqlSocketDbConnection connection) => _connection = connection;
+        public BasicSqlSocketDbCommand(BasicSqlSocketDbConnection connection) 
+        {
+            _connection = connection;
+            CommandText = string.Empty;
+            DbTransaction = null!;
+        }
         public override string CommandText { get; set; }
         public override int ExecuteNonQuery()
         {
@@ -60,6 +71,7 @@ namespace BasicSQL.EntityFramework.Storage
             // For simplicity, just return a dummy reader
             return new BasicSqlSocketDbDataReader(SendSqlRaw(CommandText));
         }
+        public override void Prepare() { /* BasicSQL doesn't support prepared statements */ }
         private int SendSql(string sql)
         {
             var response = SendSqlRaw(sql);
@@ -71,14 +83,20 @@ namespace BasicSQL.EntityFramework.Storage
             // Parse connection string for host/port
             var host = "localhost";
             var port = 4162;
+            string userId = null;
+            string password = null;
             var parts = _connection.ConnectionString.Split(';');
             foreach (var part in parts)
             {
-                var kv = part.Split('=');
+                var kv = part.Split(new[] { '=' }, 2);
                 if (kv.Length == 2)
                 {
-                    if (kv[0].Trim().ToLower() == "host") host = kv[1].Trim();
-                    if (kv[0].Trim().ToLower() == "port" && int.TryParse(kv[1], out int p)) port = p;
+                    var key = kv[0].Trim().ToLower();
+                    var value = kv[1].Trim();
+                    if (key == "host") host = value;
+                    else if (key == "port" && int.TryParse(value, out int p)) port = p;
+                    else if (key == "user id") userId = value;
+                    else if (key == "password") password = value;
                 }
             }
             using (var client = new TcpClient(host, port))
@@ -86,6 +104,16 @@ namespace BasicSQL.EntityFramework.Storage
             using (var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true })
             using (var reader = new StreamReader(stream, Encoding.UTF8))
             {
+                if (!string.IsNullOrEmpty(userId))
+                {
+                    writer.WriteLine($"AUTH {userId} {password}");
+                    var authResponse = reader.ReadLine();
+                    if (authResponse != "OK")
+                    {
+                        throw new Exception($"Authentication failed: {authResponse}");
+                    }
+                }
+
                 writer.WriteLine(sql);
                 return reader.ReadToEnd();
             }
@@ -94,6 +122,13 @@ namespace BasicSQL.EntityFramework.Storage
 
     public class BasicSqlSocketDbParameter : DbParameter
     {
+        public BasicSqlSocketDbParameter()
+        {
+            ParameterName = string.Empty;
+            SourceColumn = string.Empty;
+            Value = null!;
+        }
+        
         public override DbType DbType { get; set; }
         public override ParameterDirection Direction { get; set; }
         public override bool IsNullable { get; set; }
@@ -162,5 +197,10 @@ namespace BasicSQL.EntityFramework.Storage
         public override bool IsDBNull(int ordinal) => false;
         public override object this[int ordinal] => _data;
         public override object this[string name] => _data;
+        public override int GetValues(object[] values) 
+        { 
+            if (values.Length > 0) values[0] = _data; 
+            return Math.Min(1, values.Length); 
+        }
     }
 }

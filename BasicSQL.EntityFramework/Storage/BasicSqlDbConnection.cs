@@ -16,6 +16,12 @@ namespace BasicSQL.EntityFramework.Storage
             _connectionString = connectionString ?? "";
         }
 
+        /// <summary>
+        /// Gets or sets the last inserted ID from an INSERT operation.
+        /// This is used to return generated key values to EF Core.
+        /// </summary>
+        public int? LastInsertedId { get; set; }
+
         public override string ConnectionString
         {
             get => _connectionString;

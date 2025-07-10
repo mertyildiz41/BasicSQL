@@ -14,19 +14,20 @@ namespace BasicSQL.Parsers
         /// <summary>
         /// Parses a CREATE TABLE statement
         /// </summary>
-        public static (string tableName, List<Column> columns) ParseCreateTable(string sql)
+        public static (string tableName, List<Column> columns, bool ifNotExists) ParseCreateTable(string sql)
         {
-            var pattern = @"CREATE\s+TABLE\s+(\w+)\s*\((.*)\)";
+            var pattern = @"CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\((.*)\)";
             var match = Regex.Match(sql, pattern, RegexOptions.IgnoreCase);
 
             if (!match.Success)
                 throw new ArgumentException("Invalid CREATE TABLE syntax");
 
-            var tableName = match.Groups[1].Value;
-            var columnsString = match.Groups[2].Value;
+            var ifNotExists = match.Groups[1].Success;
+            var tableName = match.Groups[2].Value;
+            var columnsString = match.Groups[3].Value;
 
             var columns = ParseColumnDefinitions(columnsString);
-            return (tableName, columns);
+            return (tableName, columns, ifNotExists);
         }
 
         /// <summary>
@@ -142,43 +143,66 @@ namespace BasicSQL.Parsers
         {
             var query = new SelectQuery();
 
-            // Extract table name
-            var fromMatch = Regex.Match(sql, @"FROM\s+(\w+)", RegexOptions.IgnoreCase);
-            if (!fromMatch.Success)
-                throw new ArgumentException("Invalid SELECT syntax - missing FROM clause");
-            query.TableName = fromMatch.Groups[1].Value;
+            // Simplified parsing logic for clauses
+            string remainingSql = sql;
 
-            // Extract columns
-            var selectMatch = Regex.Match(sql, @"SELECT\s+(.*?)\s+FROM", RegexOptions.IgnoreCase);
-            if (!selectMatch.Success)
-                throw new ArgumentException("Invalid SELECT syntax");
-
+            // 1. SELECT
+            var selectMatch = Regex.Match(remainingSql, @"^SELECT\s+(.*?)\s+FROM", RegexOptions.IgnoreCase);
+            if (!selectMatch.Success) throw new ArgumentException("Invalid SELECT syntax");
             var columnsString = selectMatch.Groups[1].Value.Trim();
-            if (columnsString == "*")
-                query.Columns = new List<string> { "*" };
-            else
-                query.Columns = columnsString.Split(',').Select(c => c.Trim()).ToList();
+            query.Columns = columnsString == "*" ? new List<string> { "*" } : SplitValues(columnsString);
+            remainingSql = remainingSql.Substring(selectMatch.Length);
 
-            // Extract WHERE clause
-            var whereMatch = Regex.Match(sql, @"WHERE\s+(.*?)(?:\s+ORDER\s+BY|\s+LIMIT|$)", RegexOptions.IgnoreCase);
+            // 2. FROM
+            var trimmedSql = remainingSql.Trim();
+            var fromMatch = Regex.Match(trimmedSql, @"^([\w_]+)", RegexOptions.IgnoreCase);
+            if (!fromMatch.Success) throw new ArgumentException("Missing table name in FROM clause");
+            query.TableName = fromMatch.Groups[1].Value;
+            remainingSql = trimmedSql.Substring(fromMatch.Length).Trim();
+
+            // 3. JOINs
+            var joinPattern = @"^(INNER|LEFT)\s+JOIN\s+(\w+)\s+ON\s+([\w\.]+)\s*=\s*([\w\.]+)((?:\s+WHERE|\s+ORDER\s+BY|\s+LIMIT)|$)";
+            Match joinMatch;
+            while ((joinMatch = Regex.Match(remainingSql, joinPattern, RegexOptions.IgnoreCase)).Success)
+            {
+                var joinClause = new JoinClause
+                {
+                    JoinType = "LEFT".Equals(joinMatch.Groups[1].Value, StringComparison.OrdinalIgnoreCase) ? JoinType.Left : JoinType.Inner,
+                    ToTableName = joinMatch.Groups[2].Value,
+                    OnClause = $"{joinMatch.Groups[3].Value} = {joinMatch.Groups[4].Value}",
+                    ParsedOnClause = (joinMatch.Groups[3].Value, joinMatch.Groups[4].Value)
+                };
+                query.Joins.Add(joinClause);
+
+                // Remove the parsed JOIN clause from the string
+                var joinClauseLength = joinMatch.Length - joinMatch.Groups[5].Value.Length;
+                remainingSql = remainingSql.Substring(joinClauseLength).Trim();
+            }
+
+            // 4. WHERE
+            var whereMatch = Regex.Match(remainingSql, @"^WHERE\s+(.*?)(?:\s+ORDER\s+BY|\s+LIMIT|$)", RegexOptions.IgnoreCase);
             if (whereMatch.Success)
+            {
                 query.WhereClause = whereMatch.Groups[1].Value.Trim();
+            }
 
-            // Extract ORDER BY clause
+            // 5. ORDER BY
             var orderMatch = Regex.Match(sql, @"ORDER\s+BY\s+(.*?)(?:\s+LIMIT|$)", RegexOptions.IgnoreCase);
             if (orderMatch.Success)
             {
                 var orderClause = orderMatch.Groups[1].Value.Trim();
                 var orderParts = orderClause.Split(' ');
                 query.OrderByColumn = orderParts[0];
-                query.OrderDescending = orderParts.Length > 1 && 
+                query.OrderDescending = orderParts.Length > 1 &&
                     string.Equals(orderParts[1], "DESC", StringComparison.OrdinalIgnoreCase);
             }
 
-            // Extract LIMIT clause
+            // 6. LIMIT
             var limitMatch = Regex.Match(sql, @"LIMIT\s+(\d+)", RegexOptions.IgnoreCase);
             if (limitMatch.Success)
+            {
                 query.Limit = int.Parse(limitMatch.Groups[1].Value);
+            }
 
             return query;
         }
@@ -404,35 +428,99 @@ namespace BasicSQL.Parsers
         /// </summary>
         public static Func<Dictionary<string, object?>, bool> ParseWhereClause(string whereClause)
         {
-            // Simple WHERE clause parsing (column operator value)
-            var pattern = @"(\w+)\s*(=|!=|<>|<|>|<=|>=)\s*(.*)";
-            var match = Regex.Match(whereClause, pattern);
+            whereClause = whereClause.Trim();
 
-            if (!match.Success)
-                return _ => true; // If we can't parse, return all rows
+            // Handle LEN function
+            if (whereClause.StartsWith("LEN(", StringComparison.OrdinalIgnoreCase))
+            {
+                return ParseLenFunction(whereClause);
+            }
+
+            // Handle simple column comparisons
+            return ParseSimpleComparison(whereClause);
+        }
+
+        private static Func<Dictionary<string, object?>, bool> ParseLenFunction(string whereClause)
+        {
+            // Extract LEN(column) operator value
+            var match = Regex.Match(whereClause, @"LEN\s*\(\s*([\w_]+)\s*\)\s*(=|!=|<>|>|<|>=|<=)\s*(.+)", RegexOptions.IgnoreCase);
+            if (!match.Success) return _ => true;
 
             var columnName = match.Groups[1].Value;
-            var operatorStr = match.Groups[2].Value;
-            var valueString = match.Groups[3].Value;
-            var value = ParseSingleValue(valueString);
+            var op = match.Groups[2].Value;
+            var valueStr = match.Groups[3].Value.Trim();
+            var targetValue = ParseSingleValue(valueStr);
 
             return row =>
             {
-                if (!row.TryGetValue(columnName, out var rowValue))
-                    return false;
+                if (!row.TryGetValue(columnName, out var columnValue)) return false;
+                var length = columnValue?.ToString()?.Length ?? 0;
 
-                return operatorStr switch
+                return op.ToUpper() switch
                 {
-                    "=" => Equals(rowValue, value),
-                    "!=" or "<>" => !Equals(rowValue, value),
-                    "<" => CompareValues(rowValue, value) < 0,
-                    ">" => CompareValues(rowValue, value) > 0,
-                    "<=" => CompareValues(rowValue, value) <= 0,
-                    ">=" => CompareValues(rowValue, value) >= 0,
+                    "=" => length.Equals(targetValue),
+                    "!=" or "<>" => !length.Equals(targetValue),
+                    ">" => length > Convert.ToInt32(targetValue),
+                    "<" => length < Convert.ToInt32(targetValue),
+                    ">=" => length >= Convert.ToInt32(targetValue),
+                    "<=" => length <= Convert.ToInt32(targetValue),
                     _ => true
                 };
             };
         }
+
+        private static Func<Dictionary<string, object?>, bool> ParseSimpleComparison(string whereClause)
+        {
+            // Handle simple column = value, column != value, etc.
+            var match = Regex.Match(whereClause, @"([\w_]+)\s*(=|!=|<>|>|<|>=|<=)\s*(.+)", RegexOptions.IgnoreCase);
+            if (!match.Success) return _ => true;
+
+            var columnName = match.Groups[1].Value;
+            var op = match.Groups[2].Value;
+            var valueStr = match.Groups[3].Value.Trim();
+            var targetValue = ParseSingleValue(valueStr);
+
+            return row =>
+            {
+                if (!row.TryGetValue(columnName, out var columnValue)) return false;
+
+                return op.ToUpper() switch
+                {
+                    "=" => AreEqual(columnValue, targetValue),
+                    "!=" or "<>" => !AreEqual(columnValue, targetValue),
+                    ">" => CompareValues(columnValue, targetValue) > 0,
+                    "<" => CompareValues(columnValue, targetValue) < 0,
+                    ">=" => CompareValues(columnValue, targetValue) >= 0,
+                    "<=" => CompareValues(columnValue, targetValue) <= 0,
+                    _ => true
+                };
+            };
+        }
+
+        private static bool AreEqual(object? left, object? right)
+        {
+            if (left == null && right == null) return true;
+            if (left == null || right == null) return false;
+
+            // Handle numeric equality more carefully
+            if (IsNumeric(left) && IsNumeric(right))
+            {
+                try
+                {
+                    var leftDecimal = Convert.ToDecimal(left);
+                    var rightDecimal = Convert.ToDecimal(right);
+                    return leftDecimal == rightDecimal;
+                }
+                catch
+                {
+                    // Fall through to object.Equals
+                }
+            }
+
+            // For strings and other types, use direct comparison
+            return object.Equals(left, right) || string.Equals(left?.ToString(), right?.ToString(), StringComparison.OrdinalIgnoreCase);
+        }
+
 
         /// <summary>
         /// Compares two values for ordering operations
@@ -443,19 +531,51 @@ namespace BasicSQL.Parsers
             if (left == null) return -1;
             if (right == null) return 1;
 
-            if (left is IComparable leftComparable && right is IComparable)
+            // Handle numeric comparisons more robustly
+            if (IsNumeric(left) && IsNumeric(right))
             {
                 try
                 {
-                    return leftComparable.CompareTo(Convert.ChangeType(right, left.GetType()));
+                    var leftDecimal = Convert.ToDecimal(left);
+                    var rightDecimal = Convert.ToDecimal(right);
+                    return leftDecimal.CompareTo(rightDecimal);
                 }
                 catch
                 {
-                    return string.Compare(left.ToString(), right.ToString(), StringComparison.OrdinalIgnoreCase);
+                    // Fallback for types that can't be converted to decimal
+                }
+            }
+
+            if (left is IComparable leftComparable)
+            {
+                try
+                {
+                    var convertedRight = Convert.ChangeType(right, left.GetType());
+                    return leftComparable.CompareTo(convertedRight);
+                }
+                catch
+                {
+                    // Fallback to string comparison if types are not compatible
                 }
             }
 
             return string.Compare(left.ToString(), right.ToString(), StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsNumeric(object? value)
+        {
+            if (value == null) return false;
+            return value is sbyte
+                || value is byte
+                || value is short
+                || value is ushort
+                || value is int
+                || value is uint
+                || value is long
+                || value is ulong
+                || value is float
+                || value is double
+                || value is decimal;
         }
 
         /// <summary>
@@ -480,6 +600,21 @@ namespace BasicSQL.Parsers
         }
     }
 
+    public enum JoinType
+    {
+        Inner,
+        Left
+    }
+
+    public class JoinClause
+    {
+        public JoinType JoinType { get; set; }
+        public string ToTableName { get; set; } = string.Empty;
+        public string OnClause { get; set; } = string.Empty;
+        public (string leftColumn, string rightColumn) ParsedOnClause { get; set; }
+    }
+
+
     /// <summary>
     /// Represents a parsed SELECT query
     /// </summary>
@@ -487,6 +622,7 @@ namespace BasicSQL.Parsers
     {
         public string TableName { get; set; } = string.Empty;
         public List<string> Columns { get; set; } = new List<string>();
+        public List<JoinClause> Joins { get; set; } = new List<JoinClause>();
         public string? WhereClause { get; set; }
         public string? OrderByColumn { get; set; }
         public bool OrderDescending { get; set; }
